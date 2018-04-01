@@ -12,7 +12,7 @@
  *
  */
 
-
+/* Any changes to order/number of events will need to bump REPLAY_VERSION */
 enum ReplayEvents {
     /* for instruction event */
     EVENT_INSTRUCTION,
@@ -22,13 +22,18 @@ enum ReplayEvents {
     EVENT_EXCEPTION,
     /* for async events */
     EVENT_ASYNC,
-    /* for shutdown request */
+    /* for shutdown requests, range allows recovery of ShutdownCause */
     EVENT_SHUTDOWN,
+    EVENT_SHUTDOWN_LAST = EVENT_SHUTDOWN + SHUTDOWN_CAUSE__MAX,
     /* for character device write event */
     EVENT_CHAR_WRITE,
     /* for character device read all event */
     EVENT_CHAR_READ_ALL,
     EVENT_CHAR_READ_ALL_ERROR,
+    /* for audio out event */
+    EVENT_AUDIO_OUT,
+    /* for audio in event */
+    EVENT_AUDIO_IN,
     /* for clock read/writes */
     /* some of greater codes are reserved for clocks */
     EVENT_CLOCK,
@@ -50,6 +55,7 @@ enum ReplayAsyncEventKind {
     REPLAY_ASYNC_EVENT_INPUT_SYNC,
     REPLAY_ASYNC_EVENT_CHAR_READ,
     REPLAY_ASYNC_EVENT_BLOCK,
+    REPLAY_ASYNC_EVENT_NET,
     REPLAY_ASYNC_COUNT
 };
 
@@ -72,6 +78,14 @@ typedef struct ReplayState {
         This counter is global, because requests from different
         block devices should not get overlapping ids. */
     uint64_t block_request_id;
+    /*! Prior value of the host clock */
+    uint64_t host_clock_last;
+    /*! Asynchronous event type read from the log */
+    int32_t read_event_kind;
+    /*! Asynchronous event id read from the log */
+    uint64_t read_event_id;
+    /*! Asynchronous event checkpoint id read from the log */
+    int32_t read_event_checkpoint;
 } ReplayState;
 extern ReplayState replay_state;
 
@@ -92,12 +106,11 @@ int64_t replay_get_qword(void);
 void replay_get_array(uint8_t *buf, size_t *size);
 void replay_get_array_alloc(uint8_t **buf, size_t *size);
 
-/* Mutex functions for protecting replay log file */
+/* Mutex functions for protecting replay log file and ensuring
+ * synchronisation between vCPU and main-loop threads. */
 
 void replay_mutex_init(void);
-void replay_mutex_destroy(void);
-void replay_mutex_lock(void);
-void replay_mutex_unlock(void);
+bool replay_mutex_locked(void);
 
 /*! Checks error status of the file. */
 void replay_check_error(void);
@@ -160,6 +173,15 @@ void replay_event_char_read_run(void *opaque);
 void replay_event_char_read_save(void *opaque);
 /*! Reads char event read from the file. */
 void *replay_event_char_read_load(void);
+
+/* Network devices */
+
+/*! Called to run network event. */
+void replay_event_net_run(void *opaque);
+/*! Writes network event to the file. */
+void replay_event_net_save(void *opaque);
+/*! Reads network from the file. */
+void *replay_event_net_load(void);
 
 /* VMState-related functions */
 

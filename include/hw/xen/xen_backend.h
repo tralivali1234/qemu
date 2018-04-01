@@ -6,12 +6,19 @@
 #include "sysemu/sysemu.h"
 #include "net/net.h"
 
+#define TYPE_XENSYSDEV "xen-sysdev"
+#define TYPE_XENSYSBUS "xen-sysbus"
+#define TYPE_XENBACKEND "xen-backend"
+
+#define XENBACKEND_DEVICE(obj) \
+    OBJECT_CHECK(XenDevice, (obj), TYPE_XENBACKEND)
+
 /* variables */
-extern xc_interface *xen_xc;
-extern xenforeignmemory_handle *xen_fmem;
 extern struct xs_handle *xenstore;
 extern const char *xen_protocol;
+extern bool xen_feature_grant_copy;
 extern DeviceState *xen_sysdev;
+extern BusState *xen_sysbus;
 
 int xenstore_mkdir(char *path, int p);
 int xenstore_write_be_str(struct XenDevice *xendev, const char *node, const char *val);
@@ -41,12 +48,13 @@ extern struct XenDevOps xen_console_ops;      /* xen_console.c     */
 extern struct XenDevOps xen_kbdmouse_ops;     /* xen_framebuffer.c */
 extern struct XenDevOps xen_framebuffer_ops;  /* xen_framebuffer.c */
 extern struct XenDevOps xen_blkdev_ops;       /* xen_disk.c        */
+#ifdef CONFIG_VIRTFS
+extern struct XenDevOps xen_9pfs_ops;       /* xen-9p-backend.c        */
+#endif
 extern struct XenDevOps xen_netdev_ops;       /* xen_nic.c         */
 #ifdef CONFIG_USB_LIBUSB
 extern struct XenDevOps xen_usb_ops;          /* xen-usb.c         */
 #endif
-
-void xen_init_display(int domid);
 
 /* configuration (aka xenbus setup) */
 void xen_config_cleanup(void);

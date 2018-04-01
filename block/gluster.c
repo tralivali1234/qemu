@@ -7,13 +7,16 @@
  * See the COPYING file in the top-level directory.
  *
  */
+
 #include "qemu/osdep.h"
 #include <glusterfs/api/glfs.h>
 #include "block/block_int.h"
 #include "qapi/error.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/uri.h"
 #include "qemu/error-report.h"
+#include "qemu/option.h"
 #include "qemu/cutils.h"
 
 #define GLUSTER_OPT_FILENAME        "filename"
@@ -48,7 +51,7 @@ typedef struct BDRVGlusterState {
     struct glfs_fd *fd;
     char *logfile;
     bool supports_seek_data;
-    int debug_level;
+    int debug;
 } BDRVGlusterState;
 
 typedef struct BDRVGlusterReopenState {
@@ -151,7 +154,7 @@ static QemuOptsList runtime_type_opts = {
         {
             .name = GLUSTER_OPT_TYPE,
             .type = QEMU_OPT_STRING,
-            .help = "tcp|unix",
+            .help = "inet|unix",
         },
         { /* end of list */ }
     },
@@ -170,14 +173,14 @@ static QemuOptsList runtime_unix_opts = {
     },
 };
 
-static QemuOptsList runtime_tcp_opts = {
-    .name = "gluster_tcp",
-    .head = QTAILQ_HEAD_INITIALIZER(runtime_tcp_opts.head),
+static QemuOptsList runtime_inet_opts = {
+    .name = "gluster_inet",
+    .head = QTAILQ_HEAD_INITIALIZER(runtime_inet_opts.head),
     .desc = {
         {
             .name = GLUSTER_OPT_TYPE,
             .type = QEMU_OPT_STRING,
-            .help = "tcp|unix",
+            .help = "inet|unix",
         },
         {
             .name = GLUSTER_OPT_HOST,
@@ -239,12 +242,13 @@ static glfs_t *glfs_find_preopened(const char *volume)
 static void glfs_clear_preopened(glfs_t *fs)
 {
     ListElement *entry = NULL;
+    ListElement *next;
 
     if (fs == NULL) {
         return;
     }
 
-    QLIST_FOREACH(entry, &glfs_list, list) {
+    QLIST_FOREACH_SAFE(entry, &glfs_list, list, next) {
         if (entry->saved.fs == fs) {
             if (--entry->saved.ref) {
                 return;
@@ -319,7 +323,7 @@ static int parse_volume_options(BlockdevOptionsGluster *gconf, char *path)
 static int qemu_gluster_parse_uri(BlockdevOptionsGluster *gconf,
                                   const char *filename)
 {
-    GlusterServer *gsconf;
+    SocketAddress *gsconf;
     URI *uri;
     QueryParams *qp = NULL;
     bool is_unix = false;
@@ -330,21 +334,20 @@ static int qemu_gluster_parse_uri(BlockdevOptionsGluster *gconf,
         return -EINVAL;
     }
 
-    gconf->server = g_new0(GlusterServerList, 1);
-    gconf->server->value = gsconf = g_new0(GlusterServer, 1);
+    gconf->server = g_new0(SocketAddressList, 1);
+    gconf->server->value = gsconf = g_new0(SocketAddress, 1);
 
     /* transport */
     if (!uri->scheme || !strcmp(uri->scheme, "gluster")) {
-        gsconf->type = GLUSTER_TRANSPORT_TCP;
+        gsconf->type = SOCKET_ADDRESS_TYPE_INET;
     } else if (!strcmp(uri->scheme, "gluster+tcp")) {
-        gsconf->type = GLUSTER_TRANSPORT_TCP;
+        gsconf->type = SOCKET_ADDRESS_TYPE_INET;
     } else if (!strcmp(uri->scheme, "gluster+unix")) {
-        gsconf->type = GLUSTER_TRANSPORT_UNIX;
+        gsconf->type = SOCKET_ADDRESS_TYPE_UNIX;
         is_unix = true;
     } else if (!strcmp(uri->scheme, "gluster+rdma")) {
-        gsconf->type = GLUSTER_TRANSPORT_TCP;
-        error_report("Warning: rdma feature is not supported, falling "
-                     "back to tcp");
+        gsconf->type = SOCKET_ADDRESS_TYPE_INET;
+        warn_report("rdma feature is not supported, falling back to tcp");
     } else {
         ret = -EINVAL;
         goto out;
@@ -372,11 +375,11 @@ static int qemu_gluster_parse_uri(BlockdevOptionsGluster *gconf,
         }
         gsconf->u.q_unix.path = g_strdup(qp->p[0].value);
     } else {
-        gsconf->u.tcp.host = g_strdup(uri->server ? uri->server : "localhost");
+        gsconf->u.inet.host = g_strdup(uri->server ? uri->server : "localhost");
         if (uri->port) {
-            gsconf->u.tcp.port = g_strdup_printf("%d", uri->port);
+            gsconf->u.inet.port = g_strdup_printf("%d", uri->port);
         } else {
-            gsconf->u.tcp.port = g_strdup_printf("%d", GLUSTER_DEFAULT_PORT);
+            gsconf->u.inet.port = g_strdup_printf("%d", GLUSTER_DEFAULT_PORT);
         }
     }
 
@@ -394,7 +397,7 @@ static struct glfs *qemu_gluster_glfs_init(BlockdevOptionsGluster *gconf,
     struct glfs *glfs;
     int ret;
     int old_errno;
-    GlusterServerList *server;
+    SocketAddressList *server;
     unsigned long long port;
 
     glfs = glfs_find_preopened(gconf->volume);
@@ -410,22 +413,27 @@ static struct glfs *qemu_gluster_glfs_init(BlockdevOptionsGluster *gconf,
     glfs_set_preopened(gconf->volume, glfs);
 
     for (server = gconf->server; server; server = server->next) {
-        if (server->value->type  == GLUSTER_TRANSPORT_UNIX) {
-            ret = glfs_set_volfile_server(glfs,
-                                   GlusterTransport_lookup[server->value->type],
+        switch (server->value->type) {
+        case SOCKET_ADDRESS_TYPE_UNIX:
+            ret = glfs_set_volfile_server(glfs, "unix",
                                    server->value->u.q_unix.path, 0);
-        } else {
-            if (parse_uint_full(server->value->u.tcp.port, &port, 10) < 0 ||
+            break;
+        case SOCKET_ADDRESS_TYPE_INET:
+            if (parse_uint_full(server->value->u.inet.port, &port, 10) < 0 ||
                 port > 65535) {
                 error_setg(errp, "'%s' is not a valid port number",
-                           server->value->u.tcp.port);
+                           server->value->u.inet.port);
                 errno = EINVAL;
                 goto out;
             }
-            ret = glfs_set_volfile_server(glfs,
-                                   GlusterTransport_lookup[server->value->type],
-                                   server->value->u.tcp.host,
+            ret = glfs_set_volfile_server(glfs, "tcp",
+                                   server->value->u.inet.host,
                                    (int)port);
+            break;
+        case SOCKET_ADDRESS_TYPE_VSOCK:
+        case SOCKET_ADDRESS_TYPE_FD:
+        default:
+            abort();
         }
 
         if (ret < 0) {
@@ -433,7 +441,7 @@ static struct glfs *qemu_gluster_glfs_init(BlockdevOptionsGluster *gconf,
         }
     }
 
-    ret = glfs_set_logging(glfs, gconf->logfile, gconf->debug_level);
+    ret = glfs_set_logging(glfs, gconf->logfile, gconf->debug);
     if (ret < 0) {
         goto out;
     }
@@ -443,13 +451,13 @@ static struct glfs *qemu_gluster_glfs_init(BlockdevOptionsGluster *gconf,
         error_setg(errp, "Gluster connection for volume %s, path %s failed"
                          " to connect", gconf->volume, gconf->path);
         for (server = gconf->server; server; server = server->next) {
-            if (server->value->type  == GLUSTER_TRANSPORT_UNIX) {
+            if (server->value->type  == SOCKET_ADDRESS_TYPE_UNIX) {
                 error_append_hint(errp, "hint: failed on socket %s ",
                                   server->value->u.q_unix.path);
             } else {
                 error_append_hint(errp, "hint: failed on host %s and port %s ",
-                                  server->value->u.tcp.host,
-                                  server->value->u.tcp.port);
+                                  server->value->u.inet.host,
+                                  server->value->u.inet.port);
             }
         }
 
@@ -473,23 +481,6 @@ out:
     return NULL;
 }
 
-static int qapi_enum_parse(const char *opt)
-{
-    int i;
-
-    if (!opt) {
-        return GLUSTER_TRANSPORT__MAX;
-    }
-
-    for (i = 0; i < GLUSTER_TRANSPORT__MAX; i++) {
-        if (!strcmp(opt, GlusterTransport_lookup[i])) {
-            return i;
-        }
-    }
-
-    return i;
-}
-
 /*
  * Convert the json formatted command line into qapi.
 */
@@ -497,14 +488,13 @@ static int qemu_gluster_parse_json(BlockdevOptionsGluster *gconf,
                                   QDict *options, Error **errp)
 {
     QemuOpts *opts;
-    GlusterServer *gsconf;
-    GlusterServerList *curr = NULL;
+    SocketAddress *gsconf = NULL;
+    SocketAddressList *curr = NULL;
     QDict *backing_options = NULL;
     Error *local_err = NULL;
     char *str = NULL;
     const char *ptr;
-    size_t num_servers;
-    int i;
+    int i, type, num_servers;
 
     /* create opts info from runtime_json_opts list */
     opts = qemu_opts_create(&runtime_json_opts, NULL, 0, &error_abort);
@@ -546,25 +536,31 @@ static int qemu_gluster_parse_json(BlockdevOptionsGluster *gconf,
         }
 
         ptr = qemu_opt_get(opts, GLUSTER_OPT_TYPE);
-        gsconf = g_new0(GlusterServer, 1);
-        gsconf->type = qapi_enum_parse(ptr);
         if (!ptr) {
             error_setg(&local_err, QERR_MISSING_PARAMETER, GLUSTER_OPT_TYPE);
             error_append_hint(&local_err, GERR_INDEX_HINT, i);
             goto out;
 
         }
-        if (gsconf->type == GLUSTER_TRANSPORT__MAX) {
-            error_setg(&local_err, QERR_INVALID_PARAMETER_VALUE,
-                       GLUSTER_OPT_TYPE, "tcp or unix");
+        gsconf = g_new0(SocketAddress, 1);
+        if (!strcmp(ptr, "tcp")) {
+            ptr = "inet";       /* accept legacy "tcp" */
+        }
+        type = qapi_enum_parse(&SocketAddressType_lookup, ptr, -1, NULL);
+        if (type != SOCKET_ADDRESS_TYPE_INET
+            && type != SOCKET_ADDRESS_TYPE_UNIX) {
+            error_setg(&local_err,
+                       "Parameter '%s' may be 'inet' or 'unix'",
+                       GLUSTER_OPT_TYPE);
             error_append_hint(&local_err, GERR_INDEX_HINT, i);
             goto out;
         }
+        gsconf->type = type;
         qemu_opts_del(opts);
 
-        if (gsconf->type == GLUSTER_TRANSPORT_TCP) {
-            /* create opts info from runtime_tcp_opts list */
-            opts = qemu_opts_create(&runtime_tcp_opts, NULL, 0, &error_abort);
+        if (gsconf->type == SOCKET_ADDRESS_TYPE_INET) {
+            /* create opts info from runtime_inet_opts list */
+            opts = qemu_opts_create(&runtime_inet_opts, NULL, 0, &error_abort);
             qemu_opts_absorb_qdict(opts, backing_options, &local_err);
             if (local_err) {
                 goto out;
@@ -577,7 +573,7 @@ static int qemu_gluster_parse_json(BlockdevOptionsGluster *gconf,
                 error_append_hint(&local_err, GERR_INDEX_HINT, i);
                 goto out;
             }
-            gsconf->u.tcp.host = g_strdup(ptr);
+            gsconf->u.inet.host = g_strdup(ptr);
             ptr = qemu_opt_get(opts, GLUSTER_OPT_PORT);
             if (!ptr) {
                 error_setg(&local_err, QERR_MISSING_PARAMETER,
@@ -585,28 +581,28 @@ static int qemu_gluster_parse_json(BlockdevOptionsGluster *gconf,
                 error_append_hint(&local_err, GERR_INDEX_HINT, i);
                 goto out;
             }
-            gsconf->u.tcp.port = g_strdup(ptr);
+            gsconf->u.inet.port = g_strdup(ptr);
 
             /* defend for unsupported fields in InetSocketAddress,
              * i.e. @ipv4, @ipv6  and @to
              */
             ptr = qemu_opt_get(opts, GLUSTER_OPT_TO);
             if (ptr) {
-                gsconf->u.tcp.has_to = true;
+                gsconf->u.inet.has_to = true;
             }
             ptr = qemu_opt_get(opts, GLUSTER_OPT_IPV4);
             if (ptr) {
-                gsconf->u.tcp.has_ipv4 = true;
+                gsconf->u.inet.has_ipv4 = true;
             }
             ptr = qemu_opt_get(opts, GLUSTER_OPT_IPV6);
             if (ptr) {
-                gsconf->u.tcp.has_ipv6 = true;
+                gsconf->u.inet.has_ipv6 = true;
             }
-            if (gsconf->u.tcp.has_to) {
+            if (gsconf->u.inet.has_to) {
                 error_setg(&local_err, "Parameter 'to' not supported");
                 goto out;
             }
-            if (gsconf->u.tcp.has_ipv4 || gsconf->u.tcp.has_ipv6) {
+            if (gsconf->u.inet.has_ipv4 || gsconf->u.inet.has_ipv6) {
                 error_setg(&local_err, "Parameters 'ipv4/ipv6' not supported");
                 goto out;
             }
@@ -631,16 +627,18 @@ static int qemu_gluster_parse_json(BlockdevOptionsGluster *gconf,
         }
 
         if (gconf->server == NULL) {
-            gconf->server = g_new0(GlusterServerList, 1);
+            gconf->server = g_new0(SocketAddressList, 1);
             gconf->server->value = gsconf;
             curr = gconf->server;
         } else {
-            curr->next = g_new0(GlusterServerList, 1);
+            curr->next = g_new0(SocketAddressList, 1);
             curr->next->value = gsconf;
             curr = curr->next;
         }
+        gsconf = NULL;
 
-        qdict_del(backing_options, str);
+        QDECREF(backing_options);
+        backing_options = NULL;
         g_free(str);
         str = NULL;
     }
@@ -649,30 +647,30 @@ static int qemu_gluster_parse_json(BlockdevOptionsGluster *gconf,
 
 out:
     error_propagate(errp, local_err);
+    qapi_free_SocketAddress(gsconf);
     qemu_opts_del(opts);
-    if (str) {
-        qdict_del(backing_options, str);
-        g_free(str);
-    }
+    g_free(str);
+    QDECREF(backing_options);
     errno = EINVAL;
     return -errno;
 }
 
-static struct glfs *qemu_gluster_init(BlockdevOptionsGluster *gconf,
-                                      const char *filename,
-                                      QDict *options, Error **errp)
+/* Converts options given in @filename and the @options QDict into the QAPI
+ * object @gconf. */
+static int qemu_gluster_parse(BlockdevOptionsGluster *gconf,
+                              const char *filename,
+                              QDict *options, Error **errp)
 {
     int ret;
     if (filename) {
         ret = qemu_gluster_parse_uri(gconf, filename);
         if (ret < 0) {
-            error_setg(errp, "invalid URI");
+            error_setg(errp, "invalid URI %s", filename);
             error_append_hint(errp, "Usage: file=gluster[+transport]://"
                                     "[host[:port]]volume/path[?socket=...]"
                                     "[,file.debug=N]"
                                     "[,file.logfile=/path/filename.log]\n");
-            errno = -ret;
-            return NULL;
+            return ret;
         }
     } else {
         ret = qemu_gluster_parse_json(gconf, options, errp);
@@ -682,26 +680,32 @@ static struct glfs *qemu_gluster_init(BlockdevOptionsGluster *gconf,
                              "file.volume=testvol,file.path=/path/a.qcow2"
                              "[,file.debug=9]"
                              "[,file.logfile=/path/filename.log],"
-                             "file.server.0.type=tcp,"
+                             "file.server.0.type=inet,"
                              "file.server.0.host=1.2.3.4,"
                              "file.server.0.port=24007,"
                              "file.server.1.transport=unix,"
                              "file.server.1.socket=/var/run/glusterd.socket ..."
                              "\n");
-            errno = -ret;
-            return NULL;
+            return ret;
         }
+    }
 
+    return 0;
+}
+
+static struct glfs *qemu_gluster_init(BlockdevOptionsGluster *gconf,
+                                      const char *filename,
+                                      QDict *options, Error **errp)
+{
+    int ret;
+
+    ret = qemu_gluster_parse(gconf, filename, options, errp);
+    if (ret < 0) {
+        errno = -ret;
+        return NULL;
     }
 
     return qemu_gluster_glfs_init(gconf, errp);
-}
-
-static void qemu_gluster_complete_aio(void *opaque)
-{
-    GlusterAIOCB *acb = (GlusterAIOCB *)opaque;
-
-    qemu_coroutine_enter(acb->coroutine);
 }
 
 /*
@@ -719,7 +723,7 @@ static void gluster_finish_aiocb(struct glfs_fd *fd, ssize_t ret, void *arg)
         acb->ret = -EIO; /* Partial read/write - fail it */
     }
 
-    aio_bh_schedule_oneshot(acb->aio_context, qemu_gluster_complete_aio, acb);
+    aio_co_schedule(acb->aio_context, acb->coroutine);
 }
 
 static void qemu_gluster_parse_flags(int bdrv_flags, int *open_flags)
@@ -787,17 +791,17 @@ static int qemu_gluster_open(BlockDriverState *bs,  QDict *options,
 
     filename = qemu_opt_get(opts, GLUSTER_OPT_FILENAME);
 
-    s->debug_level = qemu_opt_get_number(opts, GLUSTER_OPT_DEBUG,
-                                         GLUSTER_DEBUG_DEFAULT);
-    if (s->debug_level < 0) {
-        s->debug_level = 0;
-    } else if (s->debug_level > GLUSTER_DEBUG_MAX) {
-        s->debug_level = GLUSTER_DEBUG_MAX;
+    s->debug = qemu_opt_get_number(opts, GLUSTER_OPT_DEBUG,
+                                   GLUSTER_DEBUG_DEFAULT);
+    if (s->debug < 0) {
+        s->debug = 0;
+    } else if (s->debug > GLUSTER_DEBUG_MAX) {
+        s->debug = GLUSTER_DEBUG_MAX;
     }
 
     gconf = g_new0(BlockdevOptionsGluster, 1);
-    gconf->debug_level = s->debug_level;
-    gconf->has_debug_level = true;
+    gconf->debug = s->debug;
+    gconf->has_debug = true;
 
     logfile = qemu_opt_get(opts, GLUSTER_OPT_LOGFILE);
     s->logfile = g_strdup(logfile ? logfile : GLUSTER_LOGFILE_DEFAULT);
@@ -873,8 +877,8 @@ static int qemu_gluster_reopen_prepare(BDRVReopenState *state,
     qemu_gluster_parse_flags(state->flags, &open_flags);
 
     gconf = g_new0(BlockdevOptionsGluster, 1);
-    gconf->debug_level = s->debug_level;
-    gconf->has_debug_level = true;
+    gconf->debug = s->debug;
+    gconf->has_debug = true;
     gconf->logfile = g_strdup(s->logfile);
     gconf->has_logfile = true;
     reop_s->glfs = qemu_gluster_init(gconf, state->bs->filename, NULL, errp);
@@ -973,51 +977,138 @@ static coroutine_fn int qemu_gluster_co_pwrite_zeroes(BlockDriverState *bs,
     qemu_coroutine_yield();
     return acb.ret;
 }
-
-static inline bool gluster_supports_zerofill(void)
-{
-    return 1;
-}
-
-static inline int qemu_gluster_zerofill(struct glfs_fd *fd, int64_t offset,
-                                        int64_t size)
-{
-    return glfs_zerofill(fd, offset, size);
-}
-
-#else
-static inline bool gluster_supports_zerofill(void)
-{
-    return 0;
-}
-
-static inline int qemu_gluster_zerofill(struct glfs_fd *fd, int64_t offset,
-                                        int64_t size)
-{
-    return 0;
-}
 #endif
 
-static int qemu_gluster_create(const char *filename,
-                               QemuOpts *opts, Error **errp)
+static int qemu_gluster_do_truncate(struct glfs_fd *fd, int64_t offset,
+                                    PreallocMode prealloc, Error **errp)
 {
-    BlockdevOptionsGluster *gconf;
+    int64_t current_length;
+
+    current_length = glfs_lseek(fd, 0, SEEK_END);
+    if (current_length < 0) {
+        error_setg_errno(errp, errno, "Failed to determine current size");
+        return -errno;
+    }
+
+    if (current_length > offset && prealloc != PREALLOC_MODE_OFF) {
+        error_setg(errp, "Cannot use preallocation for shrinking files");
+        return -ENOTSUP;
+    }
+
+    if (current_length == offset) {
+        return 0;
+    }
+
+    switch (prealloc) {
+#ifdef CONFIG_GLUSTERFS_FALLOCATE
+    case PREALLOC_MODE_FALLOC:
+        if (glfs_fallocate(fd, 0, current_length, offset - current_length)) {
+            error_setg_errno(errp, errno, "Could not preallocate data");
+            return -errno;
+        }
+        break;
+#endif /* CONFIG_GLUSTERFS_FALLOCATE */
+#ifdef CONFIG_GLUSTERFS_ZEROFILL
+    case PREALLOC_MODE_FULL:
+        if (glfs_ftruncate(fd, offset)) {
+            error_setg_errno(errp, errno, "Could not resize file");
+            return -errno;
+        }
+        if (glfs_zerofill(fd, current_length, offset - current_length)) {
+            error_setg_errno(errp, errno, "Could not zerofill the new area");
+            return -errno;
+        }
+        break;
+#endif /* CONFIG_GLUSTERFS_ZEROFILL */
+    case PREALLOC_MODE_OFF:
+        if (glfs_ftruncate(fd, offset)) {
+            error_setg_errno(errp, errno, "Could not resize file");
+            return -errno;
+        }
+        break;
+    default:
+        error_setg(errp, "Unsupported preallocation mode: %s",
+                   PreallocMode_str(prealloc));
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+static int qemu_gluster_co_create(BlockdevCreateOptions *options,
+                                  Error **errp)
+{
+    BlockdevCreateOptionsGluster *opts = &options->u.gluster;
     struct glfs *glfs;
-    struct glfs_fd *fd;
+    struct glfs_fd *fd = NULL;
     int ret = 0;
-    int prealloc = 0;
-    int64_t total_size = 0;
+
+    assert(options->driver == BLOCKDEV_DRIVER_GLUSTER);
+
+    glfs = qemu_gluster_glfs_init(opts->location, errp);
+    if (!glfs) {
+        ret = -errno;
+        goto out;
+    }
+
+    fd = glfs_creat(glfs, opts->location->path,
+                    O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IRUSR | S_IWUSR);
+    if (!fd) {
+        ret = -errno;
+        goto out;
+    }
+
+    ret = qemu_gluster_do_truncate(fd, opts->size, opts->preallocation, errp);
+
+out:
+    if (fd) {
+        if (glfs_close(fd) != 0 && ret == 0) {
+            ret = -errno;
+        }
+    }
+    glfs_clear_preopened(glfs);
+    return ret;
+}
+
+static int coroutine_fn qemu_gluster_co_create_opts(const char *filename,
+                                                    QemuOpts *opts,
+                                                    Error **errp)
+{
+    BlockdevCreateOptions *options;
+    BlockdevCreateOptionsGluster *gopts;
+    BlockdevOptionsGluster *gconf;
     char *tmp = NULL;
+    Error *local_err = NULL;
+    int ret;
+
+    options = g_new0(BlockdevCreateOptions, 1);
+    options->driver = BLOCKDEV_DRIVER_GLUSTER;
+    gopts = &options->u.gluster;
 
     gconf = g_new0(BlockdevOptionsGluster, 1);
-    gconf->debug_level = qemu_opt_get_number_del(opts, GLUSTER_OPT_DEBUG,
-                                                 GLUSTER_DEBUG_DEFAULT);
-    if (gconf->debug_level < 0) {
-        gconf->debug_level = 0;
-    } else if (gconf->debug_level > GLUSTER_DEBUG_MAX) {
-        gconf->debug_level = GLUSTER_DEBUG_MAX;
+    gopts->location = gconf;
+
+    gopts->size = ROUND_UP(qemu_opt_get_size_del(opts, BLOCK_OPT_SIZE, 0),
+                           BDRV_SECTOR_SIZE);
+
+    tmp = qemu_opt_get_del(opts, BLOCK_OPT_PREALLOC);
+    gopts->preallocation = qapi_enum_parse(&PreallocMode_lookup, tmp,
+                                           PREALLOC_MODE_OFF, &local_err);
+    g_free(tmp);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        ret = -EINVAL;
+        goto fail;
     }
-    gconf->has_debug_level = true;
+
+    gconf->debug = qemu_opt_get_number_del(opts, GLUSTER_OPT_DEBUG,
+                                           GLUSTER_DEBUG_DEFAULT);
+    if (gconf->debug < 0) {
+        gconf->debug = 0;
+    } else if (gconf->debug > GLUSTER_DEBUG_MAX) {
+        gconf->debug = GLUSTER_DEBUG_MAX;
+    }
+    gconf->has_debug = true;
 
     gconf->logfile = qemu_opt_get_del(opts, GLUSTER_OPT_LOGFILE);
     if (!gconf->logfile) {
@@ -1025,48 +1116,19 @@ static int qemu_gluster_create(const char *filename,
     }
     gconf->has_logfile = true;
 
-    glfs = qemu_gluster_init(gconf, filename, NULL, errp);
-    if (!glfs) {
-        ret = -errno;
-        goto out;
+    ret = qemu_gluster_parse(gconf, filename, NULL, errp);
+    if (ret < 0) {
+        goto fail;
     }
 
-    total_size = ROUND_UP(qemu_opt_get_size_del(opts, BLOCK_OPT_SIZE, 0),
-                          BDRV_SECTOR_SIZE);
-
-    tmp = qemu_opt_get_del(opts, BLOCK_OPT_PREALLOC);
-    if (!tmp || !strcmp(tmp, "off")) {
-        prealloc = 0;
-    } else if (!strcmp(tmp, "full") && gluster_supports_zerofill()) {
-        prealloc = 1;
-    } else {
-        error_setg(errp, "Invalid preallocation mode: '%s'"
-                         " or GlusterFS doesn't support zerofill API", tmp);
-        ret = -EINVAL;
-        goto out;
+    ret = qemu_gluster_co_create(options, errp);
+    if (ret < 0) {
+        goto fail;
     }
 
-    fd = glfs_creat(glfs, gconf->path,
-                    O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IRUSR | S_IWUSR);
-    if (!fd) {
-        ret = -errno;
-    } else {
-        if (!glfs_ftruncate(fd, total_size)) {
-            if (prealloc && qemu_gluster_zerofill(fd, 0, total_size)) {
-                ret = -errno;
-            }
-        } else {
-            ret = -errno;
-        }
-
-        if (glfs_close(fd) != 0) {
-            ret = -errno;
-        }
-    }
-out:
-    g_free(tmp);
-    qapi_free_BlockdevOptionsGluster(gconf);
-    glfs_clear_preopened(glfs);
+    ret = 0;
+fail:
+    qapi_free_BlockdevCreateOptions(options);
     return ret;
 }
 
@@ -1101,17 +1163,11 @@ static coroutine_fn int qemu_gluster_co_rw(BlockDriverState *bs,
     return acb.ret;
 }
 
-static int qemu_gluster_truncate(BlockDriverState *bs, int64_t offset)
+static int qemu_gluster_truncate(BlockDriverState *bs, int64_t offset,
+                                 PreallocMode prealloc, Error **errp)
 {
-    int ret;
     BDRVGlusterState *s = bs->opaque;
-
-    ret = glfs_ftruncate(s->fd, offset);
-    if (ret < 0) {
-        return -errno;
-    }
-
-    return 0;
+    return qemu_gluster_do_truncate(s->fd, offset, prealloc, errp);
 }
 
 static coroutine_fn int qemu_gluster_co_readv(BlockDriverState *bs,
@@ -1252,7 +1308,7 @@ static int qemu_gluster_has_zero_init(BlockDriverState *bs)
  * If @start is in a trailing hole or beyond EOF, return -ENXIO.
  * If we can't find out, return a negative errno other than -ENXIO.
  *
- * (Shamefully copied from raw-posix.c, only miniscule adaptions.)
+ * (Shamefully copied from file-posix.c, only miniscule adaptions.)
  */
 static int find_allocation(BlockDriverState *bs, off_t start,
                            off_t *data, off_t *hole)
@@ -1281,7 +1337,14 @@ static int find_allocation(BlockDriverState *bs, off_t start,
     if (offs < 0) {
         return -errno;          /* D3 or D4 */
     }
-    assert(offs >= start);
+
+    if (offs < start) {
+        /* This is not a valid return by lseek().  We are safe to just return
+         * -EIO in this case, and we'll treat it like D4. Unfortunately some
+         *  versions of gluster server will return offs < start, so an assert
+         *  here will unnecessarily abort QEMU. */
+        return -EIO;
+    }
 
     if (offs > start) {
         /* D2: in hole, next data at offs */
@@ -1313,7 +1376,14 @@ static int find_allocation(BlockDriverState *bs, off_t start,
     if (offs < 0) {
         return -errno;          /* D1 and (H3 or H4) */
     }
-    assert(offs >= start);
+
+    if (offs < start) {
+        /* This is not a valid return by lseek().  We are safe to just return
+         * -EIO in this case, and we'll treat it like H4. Unfortunately some
+         *  versions of gluster server will return offs < start, so an assert
+         *  here will unnecessarily abort QEMU. */
+        return -EIO;
+    }
 
     if (offs > start) {
         /*
@@ -1336,68 +1406,66 @@ exit:
 }
 
 /*
- * Returns the allocation status of the specified sectors.
+ * Returns the allocation status of the specified offset.
  *
- * If 'sector_num' is beyond the end of the disk image the return value is 0
- * and 'pnum' is set to 0.
+ * The block layer guarantees 'offset' and 'bytes' are within bounds.
  *
- * 'pnum' is set to the number of sectors (including and immediately following
- * the specified sector) that are known to be in the same
+ * 'pnum' is set to the number of bytes (including and immediately following
+ * the specified offset) that are known to be in the same
  * allocated/unallocated state.
  *
- * 'nb_sectors' is the max value 'pnum' should be set to.  If nb_sectors goes
- * beyond the end of the disk image it will be clamped.
+ * 'bytes' is the max value 'pnum' should be set to.
  *
- * (Based on raw_co_get_block_status() from raw-posix.c.)
+ * (Based on raw_co_block_status() from file-posix.c.)
  */
-static int64_t coroutine_fn qemu_gluster_co_get_block_status(
-        BlockDriverState *bs, int64_t sector_num, int nb_sectors, int *pnum,
-        BlockDriverState **file)
+static int coroutine_fn qemu_gluster_co_block_status(BlockDriverState *bs,
+                                                     bool want_zero,
+                                                     int64_t offset,
+                                                     int64_t bytes,
+                                                     int64_t *pnum,
+                                                     int64_t *map,
+                                                     BlockDriverState **file)
 {
     BDRVGlusterState *s = bs->opaque;
-    off_t start, data = 0, hole = 0;
-    int64_t total_size;
+    off_t data = 0, hole = 0;
     int ret = -EINVAL;
 
     if (!s->fd) {
         return ret;
     }
 
-    start = sector_num * BDRV_SECTOR_SIZE;
-    total_size = bdrv_getlength(bs);
-    if (total_size < 0) {
-        return total_size;
-    } else if (start >= total_size) {
-        *pnum = 0;
-        return 0;
-    } else if (start + nb_sectors * BDRV_SECTOR_SIZE > total_size) {
-        nb_sectors = DIV_ROUND_UP(total_size - start, BDRV_SECTOR_SIZE);
+    if (!want_zero) {
+        *pnum = bytes;
+        *map = offset;
+        *file = bs;
+        return BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
     }
 
-    ret = find_allocation(bs, start, &data, &hole);
+    ret = find_allocation(bs, offset, &data, &hole);
     if (ret == -ENXIO) {
         /* Trailing hole */
-        *pnum = nb_sectors;
+        *pnum = bytes;
         ret = BDRV_BLOCK_ZERO;
     } else if (ret < 0) {
         /* No info available, so pretend there are no holes */
-        *pnum = nb_sectors;
+        *pnum = bytes;
         ret = BDRV_BLOCK_DATA;
-    } else if (data == start) {
-        /* On a data extent, compute sectors to the end of the extent,
+    } else if (data == offset) {
+        /* On a data extent, compute bytes to the end of the extent,
          * possibly including a partial sector at EOF. */
-        *pnum = MIN(nb_sectors, DIV_ROUND_UP(hole - start, BDRV_SECTOR_SIZE));
+        *pnum = MIN(bytes, hole - offset);
         ret = BDRV_BLOCK_DATA;
     } else {
-        /* On a hole, compute sectors to the beginning of the next extent.  */
-        assert(hole == start);
-        *pnum = MIN(nb_sectors, (data - start) / BDRV_SECTOR_SIZE);
+        /* On a hole, compute bytes to the beginning of the next extent.  */
+        assert(hole == offset);
+        *pnum = MIN(bytes, data - offset);
         ret = BDRV_BLOCK_ZERO;
     }
 
+    *map = offset;
     *file = bs;
 
-    return ret | BDRV_BLOCK_OFFSET_VALID | start;
+    return ret | BDRV_BLOCK_OFFSET_VALID;
 }
 
 
@@ -1411,7 +1479,8 @@ static BlockDriver bdrv_gluster = {
     .bdrv_reopen_commit           = qemu_gluster_reopen_commit,
     .bdrv_reopen_abort            = qemu_gluster_reopen_abort,
     .bdrv_close                   = qemu_gluster_close,
-    .bdrv_create                  = qemu_gluster_create,
+    .bdrv_co_create               = qemu_gluster_co_create,
+    .bdrv_co_create_opts          = qemu_gluster_co_create_opts,
     .bdrv_getlength               = qemu_gluster_getlength,
     .bdrv_get_allocated_file_size = qemu_gluster_allocated_file_size,
     .bdrv_truncate                = qemu_gluster_truncate,
@@ -1425,7 +1494,7 @@ static BlockDriver bdrv_gluster = {
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
     .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
-    .bdrv_co_get_block_status     = qemu_gluster_co_get_block_status,
+    .bdrv_co_block_status         = qemu_gluster_co_block_status,
     .create_opts                  = &qemu_gluster_create_opts,
 };
 
@@ -1439,7 +1508,8 @@ static BlockDriver bdrv_gluster_tcp = {
     .bdrv_reopen_commit           = qemu_gluster_reopen_commit,
     .bdrv_reopen_abort            = qemu_gluster_reopen_abort,
     .bdrv_close                   = qemu_gluster_close,
-    .bdrv_create                  = qemu_gluster_create,
+    .bdrv_co_create               = qemu_gluster_co_create,
+    .bdrv_co_create_opts          = qemu_gluster_co_create_opts,
     .bdrv_getlength               = qemu_gluster_getlength,
     .bdrv_get_allocated_file_size = qemu_gluster_allocated_file_size,
     .bdrv_truncate                = qemu_gluster_truncate,
@@ -1453,7 +1523,7 @@ static BlockDriver bdrv_gluster_tcp = {
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
     .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
-    .bdrv_co_get_block_status     = qemu_gluster_co_get_block_status,
+    .bdrv_co_block_status         = qemu_gluster_co_block_status,
     .create_opts                  = &qemu_gluster_create_opts,
 };
 
@@ -1467,7 +1537,8 @@ static BlockDriver bdrv_gluster_unix = {
     .bdrv_reopen_commit           = qemu_gluster_reopen_commit,
     .bdrv_reopen_abort            = qemu_gluster_reopen_abort,
     .bdrv_close                   = qemu_gluster_close,
-    .bdrv_create                  = qemu_gluster_create,
+    .bdrv_co_create               = qemu_gluster_co_create,
+    .bdrv_co_create_opts          = qemu_gluster_co_create_opts,
     .bdrv_getlength               = qemu_gluster_getlength,
     .bdrv_get_allocated_file_size = qemu_gluster_allocated_file_size,
     .bdrv_truncate                = qemu_gluster_truncate,
@@ -1481,7 +1552,7 @@ static BlockDriver bdrv_gluster_unix = {
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
     .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
-    .bdrv_co_get_block_status     = qemu_gluster_co_get_block_status,
+    .bdrv_co_block_status         = qemu_gluster_co_block_status,
     .create_opts                  = &qemu_gluster_create_opts,
 };
 
@@ -1501,7 +1572,8 @@ static BlockDriver bdrv_gluster_rdma = {
     .bdrv_reopen_commit           = qemu_gluster_reopen_commit,
     .bdrv_reopen_abort            = qemu_gluster_reopen_abort,
     .bdrv_close                   = qemu_gluster_close,
-    .bdrv_create                  = qemu_gluster_create,
+    .bdrv_co_create               = qemu_gluster_co_create,
+    .bdrv_co_create_opts          = qemu_gluster_co_create_opts,
     .bdrv_getlength               = qemu_gluster_getlength,
     .bdrv_get_allocated_file_size = qemu_gluster_allocated_file_size,
     .bdrv_truncate                = qemu_gluster_truncate,
@@ -1515,7 +1587,7 @@ static BlockDriver bdrv_gluster_rdma = {
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
     .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
-    .bdrv_co_get_block_status     = qemu_gluster_co_get_block_status,
+    .bdrv_co_block_status         = qemu_gluster_co_block_status,
     .create_opts                  = &qemu_gluster_create_opts,
 };
 

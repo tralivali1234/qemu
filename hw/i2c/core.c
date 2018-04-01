@@ -10,30 +10,12 @@
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
 
-typedef struct I2CNode I2CNode;
-
-struct I2CNode {
-    I2CSlave *elt;
-    QLIST_ENTRY(I2CNode) next;
-};
-
 #define I2C_BROADCAST 0x00
-
-struct I2CBus
-{
-    BusState qbus;
-    QLIST_HEAD(, I2CNode) current_devs;
-    uint8_t saved_address;
-    bool broadcast;
-};
 
 static Property i2c_props[] = {
     DEFINE_PROP_UINT8("address", struct I2CSlave, address, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
-
-#define TYPE_I2C_BUS "i2c-bus"
-#define I2C_BUS(obj) OBJECT_CHECK(I2CBus, (obj), TYPE_I2C_BUS)
 
 static const TypeInfo i2c_bus_info = {
     .name = TYPE_I2C_BUS,
@@ -41,7 +23,7 @@ static const TypeInfo i2c_bus_info = {
     .instance_size = sizeof(I2CBus),
 };
 
-static void i2c_bus_pre_save(void *opaque)
+static int i2c_bus_pre_save(void *opaque)
 {
     I2CBus *bus = opaque;
 
@@ -53,6 +35,8 @@ static void i2c_bus_pre_save(void *opaque)
             bus->saved_address = I2C_BROADCAST;
         }
     }
+
+    return 0;
 }
 
 static const VMStateDescription vmstate_i2c_bus = {
@@ -88,18 +72,26 @@ int i2c_bus_busy(I2CBus *bus)
     return !QLIST_EMPTY(&bus->current_devs);
 }
 
-/*
- * Returns non-zero if the address is not valid.  If this is called
- * again without an intervening i2c_end_transfer(), like in the SMBus
- * case where the operation is switched from write to read, this
- * function will not rescan the bus and thus cannot fail.
- */
 /* TODO: Make this handle multiple masters.  */
+/*
+ * Start or continue an i2c transaction.  When this is called for the
+ * first time or after an i2c_end_transfer(), if it returns an error
+ * the bus transaction is terminated (or really never started).  If
+ * this is called after another i2c_start_transfer() without an
+ * intervening i2c_end_transfer(), and it returns an error, the
+ * transaction will not be terminated.  The caller must do it.
+ *
+ * This corresponds with the way real hardware works.  The SMBus
+ * protocol uses a start transfer to switch from write to read mode
+ * without releasing the bus.  If that fails, the bus is still
+ * in a transaction.
+ */
 int i2c_start_transfer(I2CBus *bus, uint8_t address, int recv)
 {
     BusChild *kid;
     I2CSlaveClass *sc;
     I2CNode *node;
+    bool bus_scanned = false;
 
     if (address == I2C_BROADCAST) {
         /*
@@ -130,6 +122,7 @@ int i2c_start_transfer(I2CBus *bus, uint8_t address, int recv)
                 }
             }
         }
+        bus_scanned = true;
     }
 
     if (QLIST_EMPTY(&bus->current_devs)) {
@@ -137,11 +130,21 @@ int i2c_start_transfer(I2CBus *bus, uint8_t address, int recv)
     }
 
     QLIST_FOREACH(node, &bus->current_devs, next) {
+        int rv;
+
         sc = I2C_SLAVE_GET_CLASS(node->elt);
         /* If the bus is already busy, assume this is a repeated
            start condition.  */
+
         if (sc->event) {
-            sc->event(node->elt, recv ? I2C_START_RECV : I2C_START_SEND);
+            rv = sc->event(node->elt, recv ? I2C_START_RECV : I2C_START_SEND);
+            if (rv && !bus->broadcast) {
+                if (bus_scanned) {
+                    /* First call, terminate the transfer. */
+                    i2c_end_transfer(bus);
+                }
+                return rv;
+            }
         }
     }
     return 0;
@@ -260,7 +263,11 @@ static int i2c_slave_qdev_init(DeviceState *dev)
     I2CSlave *s = I2C_SLAVE(dev);
     I2CSlaveClass *sc = I2C_SLAVE_GET_CLASS(s);
 
-    return sc->init(s);
+    if (sc->init) {
+        return sc->init(s);
+    }
+
+    return 0;
 }
 
 DeviceState *i2c_create_slave(I2CBus *bus, const char *name, uint8_t addr)

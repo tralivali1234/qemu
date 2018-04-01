@@ -72,6 +72,27 @@ typedef struct IplParameterBlock IplParameterBlock;
 
 extern IplParameterBlock iplb __attribute__((__aligned__(PAGE_SIZE)));
 
+#define QIPL_ADDRESS  0xcc
+
+/* Boot Menu flags */
+#define QIPL_FLAG_BM_OPTS_CMD   0x80
+#define QIPL_FLAG_BM_OPTS_ZIPL  0x40
+
+/*
+ * This definition must be kept in sync with the defininition
+ * in hw/s390x/ipl.h
+ */
+struct QemuIplParameters {
+    uint8_t  qipl_flags;
+    uint8_t  reserved1[3];
+    uint64_t netboot_start_addr;
+    uint32_t boot_menu_timeout;
+    uint8_t  reserved2[12];
+} __attribute__ ((packed));
+typedef struct QemuIplParameters QemuIplParameters;
+
+extern QemuIplParameters qipl;
+
 #define S390_IPL_TYPE_FCP 0x00
 #define S390_IPL_TYPE_CCW 0x02
 #define S390_IPL_TYPE_QEMU_SCSI 0xff

@@ -16,17 +16,8 @@
 #include "qemu/bitmap.h"
 #include "exec/address-spaces.h"
 #include "qemu/error-report.h"
+#include "trace.h"
 #include <libfdt.h>
-
-/* #define DEBUG_SPAPR_OVEC */
-
-#ifdef DEBUG_SPAPR_OVEC
-#define DPRINTFN(fmt, ...) \
-    do { fprintf(stderr, fmt "\n", ## __VA_ARGS__); } while (0)
-#else
-#define DPRINTFN(fmt, ...) \
-    do { } while (0)
-#endif
 
 #define OV_MAXBYTES 256 /* not including length byte */
 #define OV_MAXBITS (OV_MAXBYTES * BITS_PER_BYTE)
@@ -37,6 +28,17 @@
  */
 struct sPAPROptionVector {
     unsigned long *bitmap;
+    int32_t bitmap_size; /* only used for migration */
+};
+
+const VMStateDescription vmstate_spapr_ovec = {
+    .name = "spapr_option_vector",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_BITMAP(bitmap, sPAPROptionVector, 1, bitmap_size),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 sPAPROptionVector *spapr_ovec_new(void)
@@ -45,6 +47,7 @@ sPAPROptionVector *spapr_ovec_new(void)
 
     ov = g_new0(sPAPROptionVector, 1);
     ov->bitmap = bitmap_new(OV_MAXBITS);
+    ov->bitmap_size = OV_MAXBITS;
 
     return ov;
 }
@@ -198,8 +201,7 @@ sPAPROptionVector *spapr_ovec_parse_vector(target_ulong table_addr, int vector)
     for (i = 0; i < vector_len; i++) {
         uint8_t entry = ldub_phys(&address_space_memory, addr + i);
         if (entry) {
-            DPRINTFN("read guest vector %2d, byte %3d / %3d: 0x%.2x",
-                     vector, i + 1, vector_len, entry);
+            trace_spapr_ovec_parse_vector(vector, i + 1, vector_len, entry);
             guest_byte_to_bitmap(entry, ov->bitmap, i * BITS_PER_BYTE);
         }
     }
@@ -233,10 +235,9 @@ int spapr_ovec_populate_dt(void *fdt, int fdt_offset,
     for (i = 1; i < vec_len + 1; i++) {
         vec[i] = guest_byte_from_bitmap(ov->bitmap, (i - 1) * BITS_PER_BYTE);
         if (vec[i]) {
-            DPRINTFN("encoding guest vector byte %3d / %3d: 0x%.2x",
-                     i, vec_len, vec[i]);
+            trace_spapr_ovec_populate_dt(i, vec_len, vec[i]);
         }
     }
 
-    return fdt_setprop(fdt, fdt_offset, name, vec, vec_len);
+    return fdt_setprop(fdt, fdt_offset, name, vec, vec_len + 1);
 }

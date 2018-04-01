@@ -26,10 +26,8 @@
 #include "qemu-common.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
-#include "qemu/sockets.h"
-#include "qemu/coroutine.h"
-#include "migration/migration.h"
-#include "migration/qemu-file.h"
+#include "migration.h"
+#include "qemu-file.h"
 #include "trace.h"
 
 #define IO_BUF_SIZE 32768
@@ -49,6 +47,7 @@ struct QEMUFile {
     int buf_size; /* 0 when writing */
     uint8_t buf[IO_BUF_SIZE];
 
+    DECLARE_BITMAP(may_free, MAX_IOV_SIZE);
     struct iovec iov[MAX_IOV_SIZE];
     unsigned int iovcnt;
 
@@ -132,6 +131,41 @@ bool qemu_file_is_writable(QEMUFile *f)
     return f->ops->writev_buffer;
 }
 
+static void qemu_iovec_release_ram(QEMUFile *f)
+{
+    struct iovec iov;
+    unsigned long idx;
+
+    /* Find and release all the contiguous memory ranges marked as may_free. */
+    idx = find_next_bit(f->may_free, f->iovcnt, 0);
+    if (idx >= f->iovcnt) {
+        return;
+    }
+    iov = f->iov[idx];
+
+    /* The madvise() in the loop is called for iov within a continuous range and
+     * then reinitialize the iov. And in the end, madvise() is called for the
+     * last iov.
+     */
+    while ((idx = find_next_bit(f->may_free, f->iovcnt, idx + 1)) < f->iovcnt) {
+        /* check for adjacent buffer and coalesce them */
+        if (iov.iov_base + iov.iov_len == f->iov[idx].iov_base) {
+            iov.iov_len += f->iov[idx].iov_len;
+            continue;
+        }
+        if (qemu_madvise(iov.iov_base, iov.iov_len, QEMU_MADV_DONTNEED) < 0) {
+            error_report("migrate: madvise DONTNEED failed %p %zd: %s",
+                         iov.iov_base, iov.iov_len, strerror(errno));
+        }
+        iov = f->iov[idx];
+    }
+    if (qemu_madvise(iov.iov_base, iov.iov_len, QEMU_MADV_DONTNEED) < 0) {
+            error_report("migrate: madvise DONTNEED failed %p %zd: %s",
+                         iov.iov_base, iov.iov_len, strerror(errno));
+    }
+    memset(f->may_free, 0, sizeof(f->may_free));
+}
+
 /**
  * Flushes QEMUFile buffer
  *
@@ -151,6 +185,8 @@ void qemu_fflush(QEMUFile *f)
     if (f->iovcnt > 0) {
         expect = iov_size(f->iov, f->iovcnt);
         ret = f->ops->writev_buffer(f->opaque, f->iov, f->iovcnt, f->pos);
+
+        qemu_iovec_release_ram(f);
     }
 
     if (ret >= 0) {
@@ -217,7 +253,7 @@ size_t ram_control_save_page(QEMUFile *f, ram_addr_t block_offset,
     if (f->hooks && f->hooks->save_page) {
         int ret = f->hooks->save_page(f, f->opaque, block_offset,
                                       offset, size, bytes_sent);
-
+        f->bytes_xfer += size;
         if (ret != RAM_SAVE_CONTROL_DELAYED) {
             if (bytes_sent && *bytes_sent > 0) {
                 qemu_update_position(f, *bytes_sent);
@@ -304,13 +340,19 @@ int qemu_fclose(QEMUFile *f)
     return ret;
 }
 
-static void add_to_iovec(QEMUFile *f, const uint8_t *buf, size_t size)
+static void add_to_iovec(QEMUFile *f, const uint8_t *buf, size_t size,
+                         bool may_free)
 {
     /* check for adjacent buffer and coalesce them */
     if (f->iovcnt > 0 && buf == f->iov[f->iovcnt - 1].iov_base +
-        f->iov[f->iovcnt - 1].iov_len) {
+        f->iov[f->iovcnt - 1].iov_len &&
+        may_free == test_bit(f->iovcnt - 1, f->may_free))
+    {
         f->iov[f->iovcnt - 1].iov_len += size;
     } else {
+        if (may_free) {
+            set_bit(f->iovcnt, f->may_free);
+        }
         f->iov[f->iovcnt].iov_base = (uint8_t *)buf;
         f->iov[f->iovcnt++].iov_len = size;
     }
@@ -320,14 +362,15 @@ static void add_to_iovec(QEMUFile *f, const uint8_t *buf, size_t size)
     }
 }
 
-void qemu_put_buffer_async(QEMUFile *f, const uint8_t *buf, size_t size)
+void qemu_put_buffer_async(QEMUFile *f, const uint8_t *buf, size_t size,
+                           bool may_free)
 {
     if (f->last_error) {
         return;
     }
 
     f->bytes_xfer += size;
-    add_to_iovec(f, buf, size);
+    add_to_iovec(f, buf, size, may_free);
 }
 
 void qemu_put_buffer(QEMUFile *f, const uint8_t *buf, size_t size)
@@ -345,7 +388,7 @@ void qemu_put_buffer(QEMUFile *f, const uint8_t *buf, size_t size)
         }
         memcpy(f->buf + f->buf_index, buf, l);
         f->bytes_xfer += l;
-        add_to_iovec(f, f->buf + f->buf_index, l);
+        add_to_iovec(f, f->buf + f->buf_index, l, false);
         f->buf_index += l;
         if (f->buf_index == IO_BUF_SIZE) {
             qemu_fflush(f);
@@ -366,7 +409,7 @@ void qemu_put_byte(QEMUFile *f, int v)
 
     f->buf[f->buf_index] = v;
     f->bytes_xfer++;
-    add_to_iovec(f, f->buf + f->buf_index, 1);
+    add_to_iovec(f, f->buf + f->buf_index, 1, false);
     f->buf_index++;
     if (f->buf_index == IO_BUF_SIZE) {
         qemu_fflush(f);
@@ -647,7 +690,7 @@ ssize_t qemu_put_compression_data(QEMUFile *f, const uint8_t *p, size_t size,
     }
     qemu_put_be32(f, blen);
     if (f->ops->writev_buffer) {
-        add_to_iovec(f, f->buf + f->buf_index, blen);
+        add_to_iovec(f, f->buf + f->buf_index, blen, false);
     }
     f->buf_index += blen;
     if (f->buf_index == IO_BUF_SIZE) {
@@ -688,6 +731,19 @@ size_t qemu_get_counted_string(QEMUFile *f, char buf[256])
     buf[res] = 0;
 
     return res == len ? res : 0;
+}
+
+/*
+ * Put a string with one preceding byte containing its length. The length of
+ * the string should be less than 256.
+ */
+void qemu_put_counted_string(QEMUFile *f, const char *str)
+{
+    size_t len = strlen(str);
+
+    assert(len < 256);
+    qemu_put_byte(f, len);
+    qemu_put_buffer(f, (const uint8_t *)str, len);
 }
 
 /*

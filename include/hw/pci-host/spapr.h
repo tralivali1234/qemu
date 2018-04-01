@@ -79,6 +79,14 @@ struct sPAPRPHBState {
     uint64_t dma64_win_addr;
 
     uint32_t numa_node;
+
+    bool pcie_ecs; /* Allow access to PCIe extended config space? */
+
+    /* Fields for migration compatibility hacks */
+    bool pre_2_8_migration;
+    uint32_t mig_liobn;
+    hwaddr mig_mem_win_addr, mig_mem_win_size;
+    hwaddr mig_io_win_addr, mig_io_win_size;
 };
 
 #define SPAPR_PCI_MEM_WIN_BUS_OFFSET 0x80000000ULL
@@ -100,7 +108,7 @@ static inline qemu_irq spapr_phb_lsi_qirq(struct sPAPRPHBState *phb, int pin)
 {
     sPAPRMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
 
-    return xics_get_qirq(spapr->xics, phb->lsi_table[pin].irq);
+    return spapr_qirq(spapr, phb->lsi_table[pin].irq);
 }
 
 PCIHostState *spapr_create_phb(sPAPRMachineState *spapr, int index);
@@ -114,6 +122,9 @@ void spapr_pci_rtas_init(void);
 sPAPRPHBState *spapr_pci_find_phb(sPAPRMachineState *spapr, uint64_t buid);
 PCIDevice *spapr_pci_find_dev(sPAPRMachineState *spapr, uint64_t buid,
                               uint32_t config_addr);
+
+/* PCI release callback. */
+void spapr_phb_remove_pci_device_cb(DeviceState *dev);
 
 /* VFIO EEH hooks */
 #ifdef CONFIG_LINUX

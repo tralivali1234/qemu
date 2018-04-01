@@ -8,8 +8,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qapi/error.h"
-#include "target-ppc/cpu.h"
+#include "target/ppc/cpu.h"
 
 #include "hw/ppc/fdt.h"
 

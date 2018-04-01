@@ -1,7 +1,6 @@
 #ifndef SLIRP_H
 #define SLIRP_H
 
-#include "qemu/host-utils.h"
 #include "slirp_config.h"
 
 #ifdef _WIN32
@@ -183,7 +182,6 @@ struct Slirp {
     /* if states */
     struct quehead if_fastq;   /* fast queue (for interactive data) */
     struct quehead if_batchq;  /* queue for non-interactive data */
-    struct mbuf *next_m;    /* pointer to next mbuf to output */
     bool if_start_busy;     /* avoid if_start recursion */
 
     /* ip states */
@@ -230,6 +228,9 @@ extern Slirp *slirp_instance;
 #endif
 
 void if_start(Slirp *);
+
+/* ncsi.c */
+void ncsi_input(Slirp *slirp, const uint8_t *pkt, int pkt_len);
 
 #ifndef _WIN32
 #include <netdb.h>
@@ -291,10 +292,5 @@ uint8_t tcp_tos(struct socket *);
 int tcp_emu(struct socket *, struct mbuf *);
 int tcp_ctl(struct socket *);
 struct tcpcb *tcp_drop(struct tcpcb *tp, int err);
-
-#ifndef _WIN32
-#define min(x,y) ((x) < (y) ? (x) : (y))
-#define max(x,y) ((x) > (y) ? (x) : (y))
-#endif
 
 #endif
