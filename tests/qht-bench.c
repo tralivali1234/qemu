@@ -9,7 +9,7 @@
 #include "qemu/atomic.h"
 #include "qemu/qht.h"
 #include "qemu/rcu.h"
-#include "exec/tb-hash-xx.h"
+#include "qemu/xxhash.h"
 
 struct thread_stats {
     size_t rd;
@@ -25,7 +25,13 @@ struct thread_stats {
 struct thread_info {
     void (*func)(struct thread_info *);
     struct thread_stats stats;
-    uint64_t r;
+    /*
+     * Seed is in the range [1..UINT64_MAX], because the RNG requires
+     * a non-zero seed.  To use, subtract 1 and compare against the
+     * threshold with </>=.  This lets threshold = 0 never match (0% hit),
+     * and threshold = UINT64_MAX always match (100% hit).
+     */
+    uint64_t seed;
     bool write_op; /* writes alternate between insertions and removals */
     bool resize_down;
 } QEMU_ALIGNED(64); /* avoid false sharing among threads */
@@ -53,6 +59,7 @@ static unsigned long resize_delay = 1000;
 static double resize_rate; /* 0.0 to 1.0 */
 static unsigned int n_rz_threads = 1;
 static QemuThread *rz_threads;
+static bool precompute_hash;
 
 static double update_rate; /* 0.0 to 1.0 */
 static uint64_t update_threshold;
@@ -71,6 +78,7 @@ static const char commands_string[] =
     " -n = number of threads\n"
     "\n"
     " -o = offset at which keys start\n"
+    " -p = precompute hashes\n"
     "\n"
     " -g = set -s,-k,-K,-l,-r to the same value\n"
     " -s = initial size hint\n"
@@ -93,18 +101,25 @@ static void usage_complete(int argc, char *argv[])
     exit(-1);
 }
 
-static bool is_equal(const void *obj, const void *userp)
+static bool is_equal(const void *ap, const void *bp)
 {
-    const long *a = obj;
-    const long *b = userp;
+    const long *a = ap;
+    const long *b = bp;
 
     return *a == *b;
 }
 
-static inline uint32_t h(unsigned long v)
+static uint32_t h(unsigned long v)
 {
-    return tb_hash_func7(v, 0, 0, 0, 0);
+    return qemu_xxhash2(v);
 }
+
+static uint32_t hval(unsigned long v)
+{
+    return v;
+}
+
+static uint32_t (*hfunc)(unsigned long v) = h;
 
 /*
  * From: https://en.wikipedia.org/wiki/Xorshift
@@ -122,8 +137,9 @@ static uint64_t xorshift64star(uint64_t x)
 static void do_rz(struct thread_info *info)
 {
     struct thread_stats *stats = &info->stats;
+    uint64_t r = info->seed - 1;
 
-    if (info->r < resize_threshold) {
+    if (r < resize_threshold) {
         size_t size = info->resize_down ? resize_min : resize_max;
         bool resized;
 
@@ -142,28 +158,29 @@ static void do_rz(struct thread_info *info)
 static void do_rw(struct thread_info *info)
 {
     struct thread_stats *stats = &info->stats;
+    uint64_t r = info->seed - 1;
     uint32_t hash;
     long *p;
 
-    if (info->r >= update_threshold) {
+    if (r >= update_threshold) {
         bool read;
 
-        p = &keys[info->r & (lookup_range - 1)];
-        hash = h(*p);
-        read = qht_lookup(&ht, is_equal, p, hash);
+        p = &keys[r & (lookup_range - 1)];
+        hash = hfunc(*p);
+        read = qht_lookup(&ht, p, hash);
         if (read) {
             stats->rd++;
         } else {
             stats->not_rd++;
         }
     } else {
-        p = &keys[info->r & (update_range - 1)];
-        hash = h(*p);
+        p = &keys[r & (update_range - 1)];
+        hash = hfunc(*p);
         if (info->write_op) {
             bool written = false;
 
-            if (qht_lookup(&ht, is_equal, p, hash) == NULL) {
-                written = qht_insert(&ht, p, hash);
+            if (qht_lookup(&ht, p, hash) == NULL) {
+                written = qht_insert(&ht, p, hash, NULL);
             }
             if (written) {
                 stats->in++;
@@ -173,7 +190,7 @@ static void do_rw(struct thread_info *info)
         } else {
             bool removed = false;
 
-            if (qht_lookup(&ht, is_equal, p, hash)) {
+            if (qht_lookup(&ht, p, hash)) {
                 removed = qht_remove(&ht, p, hash);
             }
             if (removed) {
@@ -199,7 +216,7 @@ static void *thread_func(void *p)
 
     rcu_read_lock();
     while (!atomic_read(&test_stop)) {
-        info->r = xorshift64star(info->r);
+        info->seed = xorshift64star(info->seed);
         info->func(info);
     }
     rcu_read_unlock();
@@ -212,7 +229,7 @@ static void *thread_func(void *p)
 static void prepare_thread_info(struct thread_info *info, int i)
 {
     /* seed for the RNG; each thread should have a different one */
-    info->r = (i + 1) ^ time(NULL);
+    info->seed = (i + 1) ^ time(NULL);
     /* the first update will be a write */
     info->write_op = true;
     /* the first resize will be down */
@@ -272,10 +289,25 @@ static void pr_params(void)
 
 static void do_threshold(double rate, uint64_t *threshold)
 {
+    /*
+     * For 0 <= rate <= 1, scale to fit in a uint64_t.
+     *
+     * Scale by 2**64, with a special case for 1.0.
+     * The remainder of the possible values are scattered between 0
+     * and 0xfffffffffffff800 (nextafter(0x1p64, 0)).
+     *
+     * Note that we cannot simply scale by UINT64_MAX, because that
+     * value is not representable as an IEEE double value.
+     *
+     * If we scale by the next largest value, nextafter(0x1p64, 0),
+     * then the remainder of the possible values are scattered between
+     * 0 and 0xfffffffffffff000.  Which leaves us with a gap between
+     * the final two inputs that is twice as large as any other.
+     */
     if (rate == 1.0) {
         *threshold = UINT64_MAX;
     } else {
-        *threshold = rate * UINT64_MAX;
+        *threshold = rate * 0x1p64;
     }
 }
 
@@ -289,7 +321,9 @@ static void htable_init(void)
     /* avoid allocating memory later by allocating all the keys now */
     keys = g_malloc(sizeof(*keys) * n);
     for (i = 0; i < n; i++) {
-        keys[i] = populate_offset + i;
+        long val = populate_offset + i;
+
+        keys[i] = precompute_hash ? h(val) : hval(val);
     }
 
     /* some sanity checks */
@@ -308,7 +342,7 @@ static void htable_init(void)
     }
 
     /* initialize the hash table */
-    qht_init(&ht, qht_n_elems, qht_mode);
+    qht_init(&ht, is_equal, qht_n_elems, qht_mode);
     assert(init_size <= init_range);
 
     pr_params();
@@ -321,8 +355,8 @@ static void htable_init(void)
 
             r = xorshift64star(r);
             p = &keys[r & (init_range - 1)];
-            hash = h(*p);
-            if (qht_insert(&ht, p, hash)) {
+            hash = hfunc(*p);
+            if (qht_insert(&ht, p, hash, NULL)) {
                 break;
             }
             retries++;
@@ -387,16 +421,14 @@ static void pr_stats(void)
 
 static void run_test(void)
 {
-    unsigned int remaining;
     int i;
 
     while (atomic_read(&n_ready_threads) != n_rw_threads + n_rz_threads) {
         cpu_relax();
     }
+
     atomic_set(&test_start, true);
-    do {
-        remaining = sleep(duration);
-    } while (remaining);
+    g_usleep(duration * G_USEC_PER_SEC);
     atomic_set(&test_stop, true);
 
     for (i = 0; i < n_rw_threads; i++) {
@@ -412,7 +444,7 @@ static void parse_args(int argc, char *argv[])
     int c;
 
     for (;;) {
-        c = getopt(argc, argv, "d:D:g:k:K:l:hn:N:o:r:Rs:S:u:");
+        c = getopt(argc, argv, "d:D:g:k:K:l:hn:N:o:pr:Rs:S:u:");
         if (c < 0) {
             break;
         }
@@ -450,6 +482,10 @@ static void parse_args(int argc, char *argv[])
             break;
         case 'o':
             populate_offset = atol(optarg);
+            break;
+        case 'p':
+            precompute_hash = true;
+            hfunc = hval;
             break;
         case 'r':
             update_range = pow2ceil(atol(optarg));

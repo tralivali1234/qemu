@@ -23,9 +23,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
+#include "qemu/cutils.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
-#include "hw/arm/arm.h"
+#include "hw/arm/boot.h"
 #include "hw/arm/armv7m.h"
 #include "hw/or-irq.h"
 #include "hw/boards.h"
@@ -34,9 +36,14 @@
 #include "hw/misc/unimp.h"
 #include "hw/char/cmsdk-apb-uart.h"
 #include "hw/timer/cmsdk-apb-timer.h"
+#include "hw/timer/cmsdk-apb-dualtimer.h"
 #include "hw/misc/mps2-scc.h"
-#include "hw/devices.h"
+#include "hw/misc/mps2-fpgaio.h"
+#include "hw/ssi/pl022.h"
+#include "hw/i2c/arm_sbcon_i2c.h"
+#include "hw/net/lan9118.h"
 #include "net/net.h"
+#include "hw/watchdog/cmsdk-apb-watchdog.h"
 
 typedef enum MPS2FPGAType {
     FPGA_AN385,
@@ -53,7 +60,6 @@ typedef struct {
     MachineState parent;
 
     ARMv7MState armv7m;
-    MemoryRegion psram;
     MemoryRegion ssram1;
     MemoryRegion ssram1_m;
     MemoryRegion ssram23;
@@ -63,7 +69,12 @@ typedef struct {
     MemoryRegion blockram_m2;
     MemoryRegion blockram_m3;
     MemoryRegion sram;
+    /* FPGA APB subsystem */
     MPS2SCC scc;
+    MPS2FPGAIO fpgaio;
+    /* CMSDK APB subsystem */
+    CMSDKAPBDualTimer dualtimer;
+    CMSDKAPBWatchdog watchdog;
 } MPS2MachineState;
 
 #define TYPE_MPS2_MACHINE "mps2"
@@ -108,11 +119,19 @@ static void mps2_common_init(MachineState *machine)
     MemoryRegion *system_memory = get_system_memory();
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     DeviceState *armv7m, *sccdev;
+    int i;
 
     if (strcmp(machine->cpu_type, mc->default_cpu_type) != 0) {
         error_report("This board can only be used with CPU %s",
                      mc->default_cpu_type);
         exit(1);
+    }
+
+    if (machine->ram_size != mc->default_ram_size) {
+        char *sz = size_to_str(mc->default_ram_size);
+        error_report("Invalid RAM size, should be %s", sz);
+        g_free(sz);
+        exit(EXIT_FAILURE);
     }
 
     /* The FPGA images have an odd combination of different RAMs,
@@ -143,9 +162,7 @@ static void mps2_common_init(MachineState *machine)
      * This is of no use for QEMU so we don't implement it (as if
      * zbt_boot_ctrl is always zero).
      */
-    memory_region_allocate_system_memory(&mms->psram,
-                                         NULL, "mps.ram", 0x1000000);
-    memory_region_add_subregion(system_memory, 0x21000000, &mms->psram);
+    memory_region_add_subregion(system_memory, 0x21000000, machine->ram);
 
     switch (mmc->fpga_type) {
     case FPGA_AN385:
@@ -172,9 +189,8 @@ static void mps2_common_init(MachineState *machine)
         g_assert_not_reached();
     }
 
-    object_initialize(&mms->armv7m, sizeof(mms->armv7m), TYPE_ARMV7M);
+    object_initialize_child(OBJECT(mms), "armv7m", &mms->armv7m, TYPE_ARMV7M);
     armv7m = DEVICE(&mms->armv7m);
-    qdev_set_parent_bus(armv7m, sysbus_get_default());
     switch (mmc->fpga_type) {
     case FPGA_AN385:
         qdev_prop_set_uint32(armv7m, "num-irq", 32);
@@ -186,10 +202,10 @@ static void mps2_common_init(MachineState *machine)
         g_assert_not_reached();
     }
     qdev_prop_set_string(armv7m, "cpu-type", machine->cpu_type);
-    object_property_set_link(OBJECT(&mms->armv7m), OBJECT(system_memory),
-                             "memory", &error_abort);
-    object_property_set_bool(OBJECT(&mms->armv7m), true, "realized",
-                             &error_fatal);
+    qdev_prop_set_bit(armv7m, "enable-bitband", true);
+    object_property_set_link(OBJECT(&mms->armv7m), "memory",
+                             OBJECT(system_memory), &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(&mms->armv7m), &error_fatal);
 
     create_unimplemented_device("zbtsmram mirror", 0x00400000, 0x00400000);
     create_unimplemented_device("RESERVED 1", 0x00800000, 0x00800000);
@@ -203,10 +219,11 @@ static void mps2_common_init(MachineState *machine)
      */
     create_unimplemented_device("CMSDK APB peripheral region @0x40000000",
                                 0x40000000, 0x00010000);
-    create_unimplemented_device("CMSDK peripheral region @0x40010000",
+    create_unimplemented_device("CMSDK AHB peripheral region @0x40010000",
                                 0x40010000, 0x00010000);
     create_unimplemented_device("Extra peripheral region @0x40020000",
                                 0x40020000, 0x00010000);
+
     create_unimplemented_device("RESERVED 4", 0x40030000, 0x001D0000);
     create_unimplemented_device("VGA", 0x41000000, 0x0200000);
 
@@ -218,11 +235,10 @@ static void mps2_common_init(MachineState *machine)
          */
         Object *orgate;
         DeviceState *orgate_dev;
-        int i;
 
         orgate = object_new(TYPE_OR_IRQ);
-        object_property_set_int(orgate, 6, "num-lines", &error_fatal);
-        object_property_set_bool(orgate, true, "realized", &error_fatal);
+        object_property_set_int(orgate, "num-lines", 6, &error_fatal);
+        qdev_realize(DEVICE(orgate), NULL, &error_fatal);
         orgate_dev = DEVICE(orgate);
         qdev_connect_gpio_out(orgate_dev, 0, qdev_get_gpio_in(armv7m, 12));
 
@@ -230,7 +246,6 @@ static void mps2_common_init(MachineState *machine)
             static const hwaddr uartbase[] = {0x40004000, 0x40005000,
                                               0x40006000, 0x40007000,
                                               0x40009000};
-            Chardev *uartchr = i < MAX_SERIAL_PORTS ? serial_hds[i] : NULL;
             /* RX irq number; TX irq is always one greater */
             static const int uartirq[] = {0, 2, 4, 18, 20};
             qemu_irq txovrint = NULL, rxovrint = NULL;
@@ -245,7 +260,7 @@ static void mps2_common_init(MachineState *machine)
                                   qdev_get_gpio_in(armv7m, uartirq[i]),
                                   txovrint, rxovrint,
                                   NULL,
-                                  uartchr, SYSCLK_FRQ);
+                                  serial_hd(i), SYSCLK_FRQ);
         }
         break;
     }
@@ -256,11 +271,10 @@ static void mps2_common_init(MachineState *machine)
          */
         Object *orgate;
         DeviceState *orgate_dev;
-        int i;
 
         orgate = object_new(TYPE_OR_IRQ);
-        object_property_set_int(orgate, 10, "num-lines", &error_fatal);
-        object_property_set_bool(orgate, true, "realized", &error_fatal);
+        object_property_set_int(orgate, "num-lines", 10, &error_fatal);
+        qdev_realize(DEVICE(orgate), NULL, &error_fatal);
         orgate_dev = DEVICE(orgate);
         qdev_connect_gpio_out(orgate_dev, 0, qdev_get_gpio_in(armv7m, 12));
 
@@ -270,14 +284,12 @@ static void mps2_common_init(MachineState *machine)
             static const hwaddr uartbase[] = {0x40004000, 0x40005000,
                                               0x4002c000, 0x4002d000,
                                               0x4002e000};
-            Chardev *uartchr = i < MAX_SERIAL_PORTS ? serial_hds[i] : NULL;
             Object *txrx_orgate;
             DeviceState *txrx_orgate_dev;
 
             txrx_orgate = object_new(TYPE_OR_IRQ);
-            object_property_set_int(txrx_orgate, 2, "num-lines", &error_fatal);
-            object_property_set_bool(txrx_orgate, true, "realized",
-                                     &error_fatal);
+            object_property_set_int(txrx_orgate, "num-lines", 2, &error_fatal);
+            qdev_realize(DEVICE(txrx_orgate), NULL, &error_fatal);
             txrx_orgate_dev = DEVICE(txrx_orgate);
             qdev_connect_gpio_out(txrx_orgate_dev, 0,
                                   qdev_get_gpio_in(armv7m, uart_txrx_irqno[i]));
@@ -287,26 +299,81 @@ static void mps2_common_init(MachineState *machine)
                                   qdev_get_gpio_in(orgate_dev, i * 2),
                                   qdev_get_gpio_in(orgate_dev, i * 2 + 1),
                                   NULL,
-                                  uartchr, SYSCLK_FRQ);
+                                  serial_hd(i), SYSCLK_FRQ);
         }
         break;
     }
     default:
         g_assert_not_reached();
     }
+    for (i = 0; i < 4; i++) {
+        static const hwaddr gpiobase[] = {0x40010000, 0x40011000,
+                                          0x40012000, 0x40013000};
+        create_unimplemented_device("cmsdk-ahb-gpio", gpiobase[i], 0x1000);
+    }
 
+    /* CMSDK APB subsystem */
     cmsdk_apb_timer_create(0x40000000, qdev_get_gpio_in(armv7m, 8), SYSCLK_FRQ);
     cmsdk_apb_timer_create(0x40001000, qdev_get_gpio_in(armv7m, 9), SYSCLK_FRQ);
+    object_initialize_child(OBJECT(mms), "dualtimer", &mms->dualtimer,
+                            TYPE_CMSDK_APB_DUALTIMER);
+    qdev_prop_set_uint32(DEVICE(&mms->dualtimer), "pclk-frq", SYSCLK_FRQ);
+    sysbus_realize(SYS_BUS_DEVICE(&mms->dualtimer), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&mms->dualtimer), 0,
+                       qdev_get_gpio_in(armv7m, 10));
+    sysbus_mmio_map(SYS_BUS_DEVICE(&mms->dualtimer), 0, 0x40002000);
+    object_initialize_child(OBJECT(mms), "watchdog", &mms->watchdog,
+                            TYPE_CMSDK_APB_WATCHDOG);
+    qdev_prop_set_uint32(DEVICE(&mms->watchdog), "wdogclk-frq", SYSCLK_FRQ);
+    sysbus_realize(SYS_BUS_DEVICE(&mms->watchdog), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&mms->watchdog), 0,
+                       qdev_get_gpio_in_named(armv7m, "NMI", 0));
+    sysbus_mmio_map(SYS_BUS_DEVICE(&mms->watchdog), 0, 0x40008000);
 
-    object_initialize(&mms->scc, sizeof(mms->scc), TYPE_MPS2_SCC);
+    /* FPGA APB subsystem */
+    object_initialize_child(OBJECT(mms), "scc", &mms->scc, TYPE_MPS2_SCC);
     sccdev = DEVICE(&mms->scc);
-    qdev_set_parent_bus(sccdev, sysbus_get_default());
     qdev_prop_set_uint32(sccdev, "scc-cfg4", 0x2);
-    qdev_prop_set_uint32(sccdev, "scc-aid", 0x02000008);
+    qdev_prop_set_uint32(sccdev, "scc-aid", 0x00200008);
     qdev_prop_set_uint32(sccdev, "scc-id", mmc->scc_id);
-    object_property_set_bool(OBJECT(&mms->scc), true, "realized",
-                             &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(&mms->scc), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sccdev), 0, 0x4002f000);
+    object_initialize_child(OBJECT(mms), "fpgaio",
+                            &mms->fpgaio, TYPE_MPS2_FPGAIO);
+    qdev_prop_set_uint32(DEVICE(&mms->fpgaio), "prescale-clk", 25000000);
+    sysbus_realize(SYS_BUS_DEVICE(&mms->fpgaio), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&mms->fpgaio), 0, 0x40028000);
+    sysbus_create_simple(TYPE_PL022, 0x40025000,        /* External ADC */
+                         qdev_get_gpio_in(armv7m, 22));
+    for (i = 0; i < 2; i++) {
+        static const int spi_irqno[] = {11, 24};
+        static const hwaddr spibase[] = {0x40020000,    /* APB */
+                                         0x40021000,    /* LCD */
+                                         0x40026000,    /* Shield0 */
+                                         0x40027000};   /* Shield1 */
+        DeviceState *orgate_dev;
+        Object *orgate;
+        int j;
+
+        orgate = object_new(TYPE_OR_IRQ);
+        object_property_set_int(orgate, "num-lines", 2, &error_fatal);
+        orgate_dev = DEVICE(orgate);
+        qdev_realize(orgate_dev, NULL, &error_fatal);
+        qdev_connect_gpio_out(orgate_dev, 0,
+                              qdev_get_gpio_in(armv7m, spi_irqno[i]));
+        for (j = 0; j < 2; j++) {
+            sysbus_create_simple(TYPE_PL022, spibase[2 * i + j],
+                                 qdev_get_gpio_in(orgate_dev, j));
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        static const hwaddr i2cbase[] = {0x40022000,    /* Touch */
+                                         0x40023000,    /* Audio */
+                                         0x40029000,    /* Shield0 */
+                                         0x4002a000};   /* Shield1 */
+        sysbus_create_simple(TYPE_ARM_SBCON_I2C, i2cbase[i], NULL);
+    }
+    create_unimplemented_device("i2s", 0x40024000, 0x400);
 
     /* In hardware this is a LAN9220; the LAN9118 is software compatible
      * except that it doesn't support the checksum-offload feature.
@@ -327,6 +394,8 @@ static void mps2_class_init(ObjectClass *oc, void *data)
 
     mc->init = mps2_common_init;
     mc->max_cpus = 1;
+    mc->default_ram_size = 16 * MiB;
+    mc->default_ram_id = "mps.ram";
 }
 
 static void mps2_an385_class_init(ObjectClass *oc, void *data)
@@ -337,7 +406,7 @@ static void mps2_an385_class_init(ObjectClass *oc, void *data)
     mc->desc = "ARM MPS2 with AN385 FPGA image for Cortex-M3";
     mmc->fpga_type = FPGA_AN385;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m3");
-    mmc->scc_id = 0x41040000 | (385 << 4);
+    mmc->scc_id = 0x41043850;
 }
 
 static void mps2_an511_class_init(ObjectClass *oc, void *data)
@@ -348,7 +417,7 @@ static void mps2_an511_class_init(ObjectClass *oc, void *data)
     mc->desc = "ARM MPS2 with AN511 DesignStart FPGA image for Cortex-M3";
     mmc->fpga_type = FPGA_AN511;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m3");
-    mmc->scc_id = 0x4104000 | (511 << 4);
+    mmc->scc_id = 0x41045110;
 }
 
 static const TypeInfo mps2_info = {

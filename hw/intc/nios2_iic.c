@@ -19,9 +19,10 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qemu/module.h"
 #include "qapi/error.h"
 
+#include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "cpu.h"
 
@@ -65,14 +66,8 @@ static void altera_iic_init(Object *obj)
 static void altera_iic_realize(DeviceState *dev, Error **errp)
 {
     struct AlteraIIC *pv = ALTERA_IIC(dev);
-    Error *err = NULL;
 
-    pv->cpu = object_property_get_link(OBJECT(dev), "cpu", &err);
-    if (!pv->cpu) {
-        error_setg(errp, "altera,iic: CPU link not found: %s",
-                   error_get_pretty(err));
-        return;
-    }
+    pv->cpu = object_property_get_link(OBJECT(dev), "cpu", &error_abort);
 }
 
 static void altera_iic_class_init(ObjectClass *klass, void *data)
@@ -85,7 +80,7 @@ static void altera_iic_class_init(ObjectClass *klass, void *data)
 }
 
 static TypeInfo altera_iic_info = {
-    .name          = "altera,iic",
+    .name          = TYPE_ALTERA_IIC,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(AlteraIIC),
     .instance_init = altera_iic_init,

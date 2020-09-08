@@ -1,11 +1,12 @@
 #ifndef HW_I8257_H
 #define HW_I8257_H
 
-#include "hw/hw.h"
 #include "hw/isa/isa.h"
 #include "exec/ioport.h"
 
 #define TYPE_I8257 "i8257"
+#define I8257(obj) \
+    OBJECT_CHECK(I8257State, (obj), TYPE_I8257)
 
 typedef struct I8257Regs {
     int now[2];

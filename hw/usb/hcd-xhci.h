@@ -19,6 +19,9 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef HW_USB_HCD_XHCI_H
+#define HW_USB_HCD_XHCI_H
+
 #define TYPE_XHCI "base-xhci"
 #define TYPE_NEC_XHCI "nec-usb-xhci"
 #define TYPE_QEMU_XHCI "qemu-xhci"
@@ -140,6 +143,7 @@ typedef struct XHCIPort {
 typedef struct XHCISlot {
     bool enabled;
     bool addressed;
+    uint16_t intr;
     dma_addr_t ctx;
     USBPort *uport;
     XHCIEPContext *eps[31];
@@ -210,7 +214,7 @@ struct XHCIState {
     uint32_t dcbaap_high;
     uint32_t config;
 
-    USBPort  uports[MAX(MAXPORTS_2, MAXPORTS_3)];
+    USBPort  uports[MAX_CONST(MAXPORTS_2, MAXPORTS_3)];
     XHCIPort ports[MAXPORTS];
     XHCISlot slots[MAXSLOTS];
     uint32_t numports;
@@ -224,3 +228,5 @@ struct XHCIState {
 
     bool nec_quirks;
 };
+
+#endif

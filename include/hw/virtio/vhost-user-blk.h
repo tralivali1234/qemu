@@ -16,15 +16,16 @@
 #define VHOST_USER_BLK_H
 
 #include "standard-headers/linux/virtio_blk.h"
-#include "qemu-common.h"
-#include "hw/qdev.h"
 #include "hw/block/block.h"
 #include "chardev/char-fe.h"
 #include "hw/virtio/vhost.h"
+#include "hw/virtio/vhost-user.h"
 
 #define TYPE_VHOST_USER_BLK "vhost-user-blk"
 #define VHOST_USER_BLK(obj) \
         OBJECT_CHECK(VHostUserBlk, (obj), TYPE_VHOST_USER_BLK)
+
+#define VHOST_USER_BLK_AUTO_NUM_QUEUES UINT16_MAX
 
 typedef struct VHostUserBlk {
     VirtIODevice parent_obj;
@@ -34,8 +35,12 @@ typedef struct VHostUserBlk {
     uint16_t num_queues;
     uint32_t queue_size;
     uint32_t config_wce;
-    uint32_t config_ro;
     struct vhost_dev dev;
+    struct vhost_inflight *inflight;
+    VhostUserState vhost_user;
+    struct vhost_virtqueue *vhost_vqs;
+    VirtQueue **virtqs;
+    bool connected;
 } VHostUserBlk;
 
 #endif

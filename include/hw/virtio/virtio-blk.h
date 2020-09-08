@@ -30,16 +30,20 @@ struct virtio_blk_inhdr
     unsigned char status;
 };
 
+#define VIRTIO_BLK_AUTO_NUM_QUEUES UINT16_MAX
+
 struct VirtIOBlkConf
 {
     BlockConf conf;
     IOThread *iothread;
     char *serial;
-    uint32_t scsi;
-    uint32_t config_wce;
     uint32_t request_merging;
     uint16_t num_queues;
     uint16_t queue_size;
+    bool seg_max_adjust;
+    uint32_t max_discard_sectors;
+    uint32_t max_write_zeroes_sectors;
+    bool x_enable_wce_if_config_wce;
 };
 
 struct VirtIOBlockDataPlane;
@@ -57,6 +61,8 @@ typedef struct VirtIOBlock {
     bool dataplane_disabled;
     bool dataplane_started;
     struct VirtIOBlockDataPlane *dataplane;
+    uint64_t host_features;
+    size_t config_size;
 } VirtIOBlock;
 
 typedef struct VirtIOBlockReq {
@@ -82,5 +88,6 @@ typedef struct MultiReqBuffer {
 } MultiReqBuffer;
 
 bool virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq);
+void virtio_blk_process_queued_requests(VirtIOBlock *s, bool is_bh);
 
 #endif

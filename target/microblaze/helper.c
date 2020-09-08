@@ -24,8 +24,6 @@
 #include "qemu/host-utils.h"
 #include "exec/log.h"
 
-#define D(x)
-
 #if defined(CONFIG_USER_ONLY)
 
 void mb_cpu_do_interrupt(CPUState *cs)
@@ -35,98 +33,91 @@ void mb_cpu_do_interrupt(CPUState *cs)
 
     cs->exception_index = -1;
     env->res_addr = RES_ADDR_NONE;
-    env->regs[14] = env->sregs[SR_PC];
+    env->regs[14] = env->pc;
 }
 
-int mb_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int size, int rw,
-                            int mmu_idx)
+bool mb_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                     MMUAccessType access_type, int mmu_idx,
+                     bool probe, uintptr_t retaddr)
 {
     cs->exception_index = 0xaa;
-    cpu_dump_state(cs, stderr, fprintf, 0);
-    return 1;
+    cpu_loop_exit_restore(cs, retaddr);
 }
 
 #else /* !CONFIG_USER_ONLY */
 
-int mb_cpu_handle_mmu_fault(CPUState *cs, vaddr address, int size, int rw,
-                            int mmu_idx)
+bool mb_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                     MMUAccessType access_type, int mmu_idx,
+                     bool probe, uintptr_t retaddr)
 {
     MicroBlazeCPU *cpu = MICROBLAZE_CPU(cs);
     CPUMBState *env = &cpu->env;
+    struct microblaze_mmu_lookup lu;
     unsigned int hit;
-    unsigned int mmu_available;
-    int r = 1;
     int prot;
 
-    mmu_available = 0;
-    if (cpu->cfg.use_mmu) {
-        mmu_available = 1;
-        if ((cpu->cfg.pvr == C_PVR_FULL) &&
-            (env->pvr.regs[11] & PVR11_USE_MMU) != PVR11_USE_MMU) {
-            mmu_available = 0;
-        }
-    }
-
-    /* Translate if the MMU is available and enabled.  */
-    if (mmu_available && (env->sregs[SR_MSR] & MSR_VM)) {
-        target_ulong vaddr, paddr;
-        struct microblaze_mmu_lookup lu;
-
-        hit = mmu_translate(&env->mmu, &lu, address, rw, mmu_idx);
-        if (hit) {
-            vaddr = address & TARGET_PAGE_MASK;
-            paddr = lu.paddr + vaddr - lu.vaddr;
-
-            qemu_log_mask(CPU_LOG_MMU, "MMU map mmu=%d v=%x p=%x prot=%x\n",
-                    mmu_idx, vaddr, paddr, lu.prot);
-            tlb_set_page(cs, vaddr, paddr, lu.prot, mmu_idx, TARGET_PAGE_SIZE);
-            r = 0;
-        } else {
-            env->sregs[SR_EAR] = address;
-            qemu_log_mask(CPU_LOG_MMU, "mmu=%d miss v=%" VADDR_PRIx "\n",
-                                        mmu_idx, address);
-
-            switch (lu.err) {
-                case ERR_PROT:
-                    env->sregs[SR_ESR] = rw == 2 ? 17 : 16;
-                    env->sregs[SR_ESR] |= (rw == 1) << 10;
-                    break;
-                case ERR_MISS:
-                    env->sregs[SR_ESR] = rw == 2 ? 19 : 18;
-                    env->sregs[SR_ESR] |= (rw == 1) << 10;
-                    break;
-                default:
-                    abort();
-                    break;
-            }
-
-            if (cs->exception_index == EXCP_MMU) {
-                cpu_abort(cs, "recursive faults\n");
-            }
-
-            /* TLB miss.  */
-            cs->exception_index = EXCP_MMU;
-        }
-    } else {
+    if (mmu_idx == MMU_NOMMU_IDX) {
         /* MMU disabled or not available.  */
         address &= TARGET_PAGE_MASK;
         prot = PAGE_BITS;
         tlb_set_page(cs, address, address, prot, mmu_idx, TARGET_PAGE_SIZE);
-        r = 0;
+        return true;
     }
-    return r;
+
+    hit = mmu_translate(&env->mmu, &lu, address, access_type, mmu_idx);
+    if (likely(hit)) {
+        uint32_t vaddr = address & TARGET_PAGE_MASK;
+        uint32_t paddr = lu.paddr + vaddr - lu.vaddr;
+
+        qemu_log_mask(CPU_LOG_MMU, "MMU map mmu=%d v=%x p=%x prot=%x\n",
+                      mmu_idx, vaddr, paddr, lu.prot);
+        tlb_set_page(cs, vaddr, paddr, lu.prot, mmu_idx, TARGET_PAGE_SIZE);
+        return true;
+    }
+
+    /* TLB miss.  */
+    if (probe) {
+        return false;
+    }
+
+    qemu_log_mask(CPU_LOG_MMU, "mmu=%d miss v=%" VADDR_PRIx "\n",
+                  mmu_idx, address);
+
+    env->ear = address;
+    switch (lu.err) {
+    case ERR_PROT:
+        env->esr = access_type == MMU_INST_FETCH ? 17 : 16;
+        env->esr |= (access_type == MMU_DATA_STORE) << 10;
+        break;
+    case ERR_MISS:
+        env->esr = access_type == MMU_INST_FETCH ? 19 : 18;
+        env->esr |= (access_type == MMU_DATA_STORE) << 10;
+        break;
+    default:
+        abort();
+    }
+
+    if (cs->exception_index == EXCP_MMU) {
+        cpu_abort(cs, "recursive faults\n");
+    }
+
+    /* TLB miss.  */
+    cs->exception_index = EXCP_MMU;
+    cpu_loop_exit_restore(cs, retaddr);
 }
 
 void mb_cpu_do_interrupt(CPUState *cs)
 {
     MicroBlazeCPU *cpu = MICROBLAZE_CPU(cs);
     CPUMBState *env = &cpu->env;
-    uint32_t t;
+    uint32_t t, msr = mb_cpu_read_msr(env);
 
     /* IMM flag cannot propagate across a branch and into the dslot.  */
-    assert(!((env->iflags & D_FLAG) && (env->iflags & IMM_FLAG)));
+    assert((env->iflags & (D_FLAG | IMM_FLAG)) != (D_FLAG | IMM_FLAG));
+    /* BIMM flag cannot be set without D_FLAG. */
+    assert((env->iflags & (D_FLAG | BIMM_FLAG)) != BIMM_FLAG);
+    /* RTI flags are private to translate. */
     assert(!(env->iflags & (DRTI_FLAG | DRTE_FLAG | DRTB_FLAG)));
-/*    assert(env->sregs[SR_MSR] & (MSR_EE)); Only for HW exceptions.  */
     env->res_addr = RES_ADDR_NONE;
     switch (cs->exception_index) {
         case EXCP_HW_EXCP:
@@ -135,77 +126,79 @@ void mb_cpu_do_interrupt(CPUState *cs)
                 return;
             }
 
-            env->regs[17] = env->sregs[SR_PC] + 4;
-            env->sregs[SR_ESR] &= ~(1 << 12);
+            env->regs[17] = env->pc + 4;
+            env->esr &= ~(1 << 12);
 
             /* Exception breaks branch + dslot sequence?  */
             if (env->iflags & D_FLAG) {
-                env->sregs[SR_ESR] |= 1 << 12 ;
-                env->sregs[SR_BTR] = env->btarget;
+                env->esr |= 1 << 12 ;
+                env->btr = env->btarget;
             }
 
             /* Disable the MMU.  */
-            t = (env->sregs[SR_MSR] & (MSR_VM | MSR_UM)) << 1;
-            env->sregs[SR_MSR] &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM);
-            env->sregs[SR_MSR] |= t;
+            t = (msr & (MSR_VM | MSR_UM)) << 1;
+            msr &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM);
+            msr |= t;
             /* Exception in progress.  */
-            env->sregs[SR_MSR] |= MSR_EIP;
+            msr |= MSR_EIP;
+            mb_cpu_write_msr(env, msr);
 
             qemu_log_mask(CPU_LOG_INT,
-                          "hw exception at pc=%x ear=%x esr=%x iflags=%x\n",
-                          env->sregs[SR_PC], env->sregs[SR_EAR],
-                          env->sregs[SR_ESR], env->iflags);
+                          "hw exception at pc=%x ear=%" PRIx64 " "
+                          "esr=%x iflags=%x\n",
+                          env->pc, env->ear,
+                          env->esr, env->iflags);
             log_cpu_state_mask(CPU_LOG_INT, cs, 0);
-            env->iflags &= ~(IMM_FLAG | D_FLAG);
-            env->sregs[SR_PC] = cpu->cfg.base_vectors + 0x20;
+            env->iflags = 0;
+            env->pc = cpu->cfg.base_vectors + 0x20;
             break;
 
         case EXCP_MMU:
-            env->regs[17] = env->sregs[SR_PC];
+            env->regs[17] = env->pc;
 
-            env->sregs[SR_ESR] &= ~(1 << 12);
+            qemu_log_mask(CPU_LOG_INT,
+                          "MMU exception at pc=%x iflags=%x ear=%" PRIx64 "\n",
+                          env->pc, env->iflags, env->ear);
+
+            env->esr &= ~(1 << 12);
             /* Exception breaks branch + dslot sequence?  */
             if (env->iflags & D_FLAG) {
-                D(qemu_log("D_FLAG set at exception bimm=%d\n", env->bimm));
-                env->sregs[SR_ESR] |= 1 << 12 ;
-                env->sregs[SR_BTR] = env->btarget;
+                env->esr |= 1 << 12 ;
+                env->btr = env->btarget;
 
                 /* Reexecute the branch.  */
                 env->regs[17] -= 4;
                 /* was the branch immprefixed?.  */
-                if (env->bimm) {
-                    qemu_log_mask(CPU_LOG_INT,
-                                  "bimm exception at pc=%x iflags=%x\n",
-                                  env->sregs[SR_PC], env->iflags);
+                if (env->iflags & BIMM_FLAG) {
                     env->regs[17] -= 4;
                     log_cpu_state_mask(CPU_LOG_INT, cs, 0);
                 }
             } else if (env->iflags & IMM_FLAG) {
-                D(qemu_log("IMM_FLAG set at exception\n"));
                 env->regs[17] -= 4;
             }
 
             /* Disable the MMU.  */
-            t = (env->sregs[SR_MSR] & (MSR_VM | MSR_UM)) << 1;
-            env->sregs[SR_MSR] &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM);
-            env->sregs[SR_MSR] |= t;
+            t = (msr & (MSR_VM | MSR_UM)) << 1;
+            msr &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM);
+            msr |= t;
             /* Exception in progress.  */
-            env->sregs[SR_MSR] |= MSR_EIP;
+            msr |= MSR_EIP;
+            mb_cpu_write_msr(env, msr);
 
             qemu_log_mask(CPU_LOG_INT,
-                          "exception at pc=%x ear=%x iflags=%x\n",
-                          env->sregs[SR_PC], env->sregs[SR_EAR], env->iflags);
+                          "exception at pc=%x ear=%" PRIx64 " iflags=%x\n",
+                          env->pc, env->ear, env->iflags);
             log_cpu_state_mask(CPU_LOG_INT, cs, 0);
-            env->iflags &= ~(IMM_FLAG | D_FLAG);
-            env->sregs[SR_PC] = cpu->cfg.base_vectors + 0x20;
+            env->iflags = 0;
+            env->pc = cpu->cfg.base_vectors + 0x20;
             break;
 
         case EXCP_IRQ:
-            assert(!(env->sregs[SR_MSR] & (MSR_EIP | MSR_BIP)));
-            assert(env->sregs[SR_MSR] & MSR_IE);
-            assert(!(env->iflags & D_FLAG));
+            assert(!(msr & (MSR_EIP | MSR_BIP)));
+            assert(msr & MSR_IE);
+            assert(!(env->iflags & (D_FLAG | IMM_FLAG)));
 
-            t = (env->sregs[SR_MSR] & (MSR_VM | MSR_UM)) << 1;
+            t = (msr & (MSR_VM | MSR_UM)) << 1;
 
 #if 0
 #include "disas/disas.h"
@@ -215,51 +208,47 @@ void mb_cpu_do_interrupt(CPUState *cs)
             {
                 const char *sym;
 
-                sym = lookup_symbol(env->sregs[SR_PC]);
+                sym = lookup_symbol(env->pc);
                 if (sym
                     && (!strcmp("netif_rx", sym)
                         || !strcmp("process_backlog", sym))) {
 
-                    qemu_log(
-                         "interrupt at pc=%x msr=%x %x iflags=%x sym=%s\n",
-                         env->sregs[SR_PC], env->sregs[SR_MSR], t, env->iflags,
-                         sym);
+                    qemu_log("interrupt at pc=%x msr=%x %x iflags=%x sym=%s\n",
+                             env->pc, msr, t, env->iflags, sym);
 
                     log_cpu_state(cs, 0);
                 }
             }
 #endif
             qemu_log_mask(CPU_LOG_INT,
-                         "interrupt at pc=%x msr=%x %x iflags=%x\n",
-                         env->sregs[SR_PC], env->sregs[SR_MSR], t, env->iflags);
+                          "interrupt at pc=%x msr=%x %x iflags=%x\n",
+                          env->pc, msr, t, env->iflags);
 
-            env->sregs[SR_MSR] &= ~(MSR_VMS | MSR_UMS | MSR_VM \
-                                    | MSR_UM | MSR_IE);
-            env->sregs[SR_MSR] |= t;
+            msr &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM | MSR_IE);
+            msr |= t;
+            mb_cpu_write_msr(env, msr);
 
-            env->regs[14] = env->sregs[SR_PC];
-            env->sregs[SR_PC] = cpu->cfg.base_vectors + 0x10;
+            env->regs[14] = env->pc;
+            env->iflags = 0;
+            env->pc = cpu->cfg.base_vectors + 0x10;
             //log_cpu_state_mask(CPU_LOG_INT, cs, 0);
             break;
 
-        case EXCP_BREAK:
         case EXCP_HW_BREAK:
-            assert(!(env->iflags & IMM_FLAG));
-            assert(!(env->iflags & D_FLAG));
-            t = (env->sregs[SR_MSR] & (MSR_VM | MSR_UM)) << 1;
+            assert(!(env->iflags & (D_FLAG | IMM_FLAG)));
+
+            t = (msr & (MSR_VM | MSR_UM)) << 1;
             qemu_log_mask(CPU_LOG_INT,
-                        "break at pc=%x msr=%x %x iflags=%x\n",
-                        env->sregs[SR_PC], env->sregs[SR_MSR], t, env->iflags);
+                          "break at pc=%x msr=%x %x iflags=%x\n",
+                          env->pc, msr, t, env->iflags);
             log_cpu_state_mask(CPU_LOG_INT, cs, 0);
-            env->sregs[SR_MSR] &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM);
-            env->sregs[SR_MSR] |= t;
-            env->sregs[SR_MSR] |= MSR_BIP;
-            if (cs->exception_index == EXCP_HW_BREAK) {
-                env->regs[16] = env->sregs[SR_PC];
-                env->sregs[SR_MSR] |= MSR_BIP;
-                env->sregs[SR_PC] = cpu->cfg.base_vectors + 0x18;
-            } else
-                env->sregs[SR_PC] = env->btarget;
+            msr &= ~(MSR_VMS | MSR_UMS | MSR_VM | MSR_UM);
+            msr |= t;
+            msr |= MSR_BIP;
+            env->regs[16] = env->pc;
+            env->iflags = 0;
+            env->pc = cpu->cfg.base_vectors + 0x18;
+            mb_cpu_write_msr(env, msr);
             break;
         default:
             cpu_abort(cs, "unhandled exception type=%d\n",
@@ -274,9 +263,10 @@ hwaddr mb_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
     CPUMBState *env = &cpu->env;
     target_ulong vaddr, paddr = 0;
     struct microblaze_mmu_lookup lu;
+    int mmu_idx = cpu_mmu_index(env, false);
     unsigned int hit;
 
-    if (env->sregs[SR_MSR] & MSR_VM) {
+    if (mmu_idx != MMU_NOMMU_IDX) {
         hit = mmu_translate(&env->mmu, &lu, addr, 0, 0);
         if (hit) {
             vaddr = addr & TARGET_PAGE_MASK;
@@ -296,12 +286,40 @@ bool mb_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     CPUMBState *env = &cpu->env;
 
     if ((interrupt_request & CPU_INTERRUPT_HARD)
-        && (env->sregs[SR_MSR] & MSR_IE)
-        && !(env->sregs[SR_MSR] & (MSR_EIP | MSR_BIP))
+        && (env->msr & MSR_IE)
+        && !(env->msr & (MSR_EIP | MSR_BIP))
         && !(env->iflags & (D_FLAG | IMM_FLAG))) {
         cs->exception_index = EXCP_IRQ;
         mb_cpu_do_interrupt(cs);
         return true;
     }
     return false;
+}
+
+void mb_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+                                MMUAccessType access_type,
+                                int mmu_idx, uintptr_t retaddr)
+{
+    MicroBlazeCPU *cpu = MICROBLAZE_CPU(cs);
+    uint32_t esr, iflags;
+
+    /* Recover the pc and iflags from the corresponding insn_start.  */
+    cpu_restore_state(cs, retaddr, true);
+    iflags = cpu->env.iflags;
+
+    qemu_log_mask(CPU_LOG_INT,
+                  "Unaligned access addr=" TARGET_FMT_lx " pc=%x iflags=%x\n",
+                  (target_ulong)addr, cpu->env.pc, iflags);
+
+    esr = ESR_EC_UNALIGNED_DATA;
+    if (likely(iflags & ESR_ESS_FLAG)) {
+        esr |= iflags & ESR_ESS_MASK;
+    } else {
+        qemu_log_mask(LOG_UNIMP, "Unaligned access without ESR_ESS_FLAG\n");
+    }
+
+    cpu->env.ear = addr;
+    cpu->env.esr = esr;
+    cs->exception_index = EXCP_HW_EXCP;
+    cpu_loop_exit(cs);
 }

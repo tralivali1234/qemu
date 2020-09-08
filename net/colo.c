@@ -14,7 +14,8 @@
 
 #include "qemu/osdep.h"
 #include "trace.h"
-#include "net/colo.h"
+#include "colo.h"
+#include "util.h"
 
 uint32_t connection_key_hash(const void *opaque)
 {
@@ -137,7 +138,7 @@ Connection *connection_new(ConnectionKey *key)
     conn->ip_proto = key->ip_proto;
     conn->processing = false;
     conn->offset = 0;
-    conn->syn_flag = 0;
+    conn->tcp_state = TCPS_CLOSED;
     conn->pack = 0;
     conn->sack = 0;
     g_queue_init(&conn->primary_list);
@@ -184,6 +185,13 @@ void packet_destroy(void *opaque, void *user_data)
     g_slice_free(Packet, pkt);
 }
 
+void packet_destroy_partial(void *opaque, void *user_data)
+{
+    Packet *pkt = opaque;
+
+    g_slice_free(Packet, pkt);
+}
+
 /*
  * Clear hashtable, stop this hash growing really huge
  */
@@ -220,4 +228,12 @@ Connection *connection_get(GHashTable *connection_track_table,
     }
 
     return conn;
+}
+
+bool connection_has_tracked(GHashTable *connection_track_table,
+                            ConnectionKey *key)
+{
+    Connection *conn = g_hash_table_lookup(connection_track_table, key);
+
+    return conn ? true : false;
 }

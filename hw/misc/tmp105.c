@@ -19,11 +19,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/hw.h"
 #include "hw/i2c/i2c.h"
+#include "hw/irq.h"
+#include "migration/vmstate.h"
 #include "tmp105.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
+#include "qemu/module.h"
 
 static void tmp105_interrupt_update(TMP105State *s)
 {
@@ -70,16 +72,13 @@ static void tmp105_set_temperature(Object *obj, Visitor *v, const char *name,
                                    void *opaque, Error **errp)
 {
     TMP105State *s = TMP105(obj);
-    Error *local_err = NULL;
     int64_t temp;
 
-    visit_type_int(v, name, &temp, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_int(v, name, &temp, errp)) {
         return;
     }
     if (temp >= 128000 || temp < -128000) {
-        error_setg(errp, "value %" PRId64 ".%03" PRIu64 " °C is out of range",
+        error_setg(errp, "value %" PRId64 ".%03" PRIu64 " C is out of range",
                    temp / 1000, temp % 1000);
         return;
     }
@@ -147,7 +146,7 @@ static void tmp105_write(TMP105State *s)
     }
 }
 
-static int tmp105_rx(I2CSlave *i2c)
+static uint8_t tmp105_rx(I2CSlave *i2c)
 {
     TMP105State *s = TMP105(i2c);
 
@@ -229,22 +228,21 @@ static void tmp105_reset(I2CSlave *i2c)
     tmp105_interrupt_update(s);
 }
 
-static int tmp105_init(I2CSlave *i2c)
+static void tmp105_realize(DeviceState *dev, Error **errp)
 {
+    I2CSlave *i2c = I2C_SLAVE(dev);
     TMP105State *s = TMP105(i2c);
 
     qdev_init_gpio_out(&i2c->qdev, &s->pin, 1);
 
     tmp105_reset(&s->i2c);
-
-    return 0;
 }
 
 static void tmp105_initfn(Object *obj)
 {
     object_property_add(obj, "temperature", "int",
                         tmp105_get_temperature,
-                        tmp105_set_temperature, NULL, NULL, NULL);
+                        tmp105_set_temperature, NULL, NULL);
 }
 
 static void tmp105_class_init(ObjectClass *klass, void *data)
@@ -252,7 +250,7 @@ static void tmp105_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
 
-    k->init = tmp105_init;
+    dc->realize = tmp105_realize;
     k->event = tmp105_event;
     k->recv = tmp105_rx;
     k->send = tmp105_tx;

@@ -40,6 +40,8 @@
 #include "qemu-common.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "qemu/sockets.h"
 
 #include "net/tap.h"
 
@@ -252,7 +254,8 @@ static void tap_set_vnet_hdr_len(NetClientState *nc, int len)
 
     assert(nc->info->type == NET_CLIENT_DRIVER_TAP);
     assert(len == sizeof(struct virtio_net_hdr_mrg_rxbuf) ||
-           len == sizeof(struct virtio_net_hdr));
+           len == sizeof(struct virtio_net_hdr) ||
+           len == sizeof(struct virtio_net_hdr_v1_hash));
 
     tap_fd_set_vnet_hdr_len(s->fd, len);
     s->host_vnet_hdr_len = len;
@@ -497,9 +500,9 @@ static int net_bridge_run_helper(const char *helper, const char *bridge,
     }
     if (pid == 0) {
         int open_max = sysconf(_SC_OPEN_MAX), i;
-        char fd_buf[6+10];
-        char br_buf[6+IFNAMSIZ] = {0};
-        char helper_cmd[PATH_MAX + sizeof(fd_buf) + sizeof(br_buf) + 15];
+        char *fd_buf = NULL;
+        char *br_buf = NULL;
+        char *helper_cmd = NULL;
 
         for (i = 3; i < open_max; i++) {
             if (i != sv[1]) {
@@ -507,17 +510,17 @@ static int net_bridge_run_helper(const char *helper, const char *bridge,
             }
         }
 
-        snprintf(fd_buf, sizeof(fd_buf), "%s%d", "--fd=", sv[1]);
+        fd_buf = g_strdup_printf("%s%d", "--fd=", sv[1]);
 
         if (strrchr(helper, ' ') || strrchr(helper, '\t')) {
             /* assume helper is a command */
 
             if (strstr(helper, "--br=") == NULL) {
-                snprintf(br_buf, sizeof(br_buf), "%s%s", "--br=", bridge);
+                br_buf = g_strdup_printf("%s%s", "--br=", bridge);
             }
 
-            snprintf(helper_cmd, sizeof(helper_cmd), "%s %s %s %s",
-                     helper, "--use-vnet", fd_buf, br_buf);
+            helper_cmd = g_strdup_printf("%s %s %s %s", helper,
+                            "--use-vnet", fd_buf, br_buf ? br_buf : "");
 
             parg = args;
             *parg++ = (char *)"sh";
@@ -526,10 +529,11 @@ static int net_bridge_run_helper(const char *helper, const char *bridge,
             *parg++ = NULL;
 
             execv("/bin/sh", args);
+            g_free(helper_cmd);
         } else {
             /* assume helper is just the executable path name */
 
-            snprintf(br_buf, sizeof(br_buf), "%s%s", "--br=", bridge);
+            br_buf = g_strdup_printf("%s%s", "--br=", bridge);
 
             parg = args;
             *parg++ = (char *)helper;
@@ -540,6 +544,8 @@ static int net_bridge_run_helper(const char *helper, const char *bridge,
 
             execv(helper, args);
         }
+        g_free(fd_buf);
+        g_free(br_buf);
         _exit(1);
 
     } else {
@@ -591,8 +597,12 @@ int net_init_bridge(const Netdev *netdev, const char *name,
         return -1;
     }
 
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    vnet_hdr = tap_probe_vnet_hdr(fd);
+    qemu_set_nonblock(fd);
+    vnet_hdr = tap_probe_vnet_hdr(fd, errp);
+    if (vnet_hdr < 0) {
+        close(fd);
+        return -1;
+    }
     s = net_tap_fd_init(peer, "bridge", name, fd, vnet_hdr);
 
     snprintf(s->nc.info_str, sizeof(s->nc.info_str), "helper=%s,br=%s", helper,
@@ -684,6 +694,8 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
         }
 
         if (vhostfdname) {
+            int ret;
+
             vhostfd = monitor_fd_param(cur_mon, vhostfdname, &err);
             if (vhostfd == -1) {
                 if (tap->has_vhostforce && tap->vhostforce) {
@@ -691,6 +703,12 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
                 } else {
                     warn_report_err(err);
                 }
+                return;
+            }
+            ret = qemu_try_set_nonblock(vhostfd);
+            if (ret < 0) {
+                error_setg_errno(errp, -ret, "%s: Can't use file descriptor %d",
+                                 name, fd);
                 return;
             }
         } else {
@@ -705,7 +723,7 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
                 }
                 return;
             }
-            fcntl(vhostfd, F_SETFL, O_NONBLOCK);
+            qemu_set_nonblock(vhostfd);
         }
         options.opaque = (void *)(uintptr_t)vhostfd;
 
@@ -760,16 +778,17 @@ int net_init_tap(const Netdev *netdev, const char *name,
     Error *err = NULL;
     const char *vhostfdname;
     char ifname[128];
+    int ret = 0;
 
     assert(netdev->type == NET_CLIENT_DRIVER_TAP);
     tap = &netdev->u.tap;
     queues = tap->has_queues ? tap->queues : 1;
     vhostfdname = tap->has_vhostfd ? tap->vhostfd : NULL;
 
-    /* QEMU vlans does not support multiqueue tap, in this case peer is set.
+    /* QEMU hubs do not support multiqueue tap, in this case peer is set.
      * For -netdev, peer is always NULL. */
     if (peer && (tap->has_queues || tap->has_fds || tap->has_vhostfds)) {
-        error_setg(errp, "Multiqueue tap cannot be used with QEMU vlans");
+        error_setg(errp, "Multiqueue tap cannot be used with hubs");
         return -1;
     }
 
@@ -783,15 +802,23 @@ int net_init_tap(const Netdev *netdev, const char *name,
             return -1;
         }
 
-        fd = monitor_fd_param(cur_mon, tap->fd, &err);
+        fd = monitor_fd_param(cur_mon, tap->fd, errp);
         if (fd == -1) {
-            error_propagate(errp, err);
             return -1;
         }
 
-        fcntl(fd, F_SETFL, O_NONBLOCK);
+        ret = qemu_try_set_nonblock(fd);
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "%s: Can't use file descriptor %d",
+                             name, fd);
+            return -1;
+        }
 
-        vnet_hdr = tap_probe_vnet_hdr(fd);
+        vnet_hdr = tap_probe_vnet_hdr(fd, errp);
+        if (vnet_hdr < 0) {
+            close(fd);
+            return -1;
+        }
 
         net_init_tap_one(tap, peer, "tap", name, NULL,
                          script, downscript,
@@ -803,7 +830,7 @@ int net_init_tap(const Netdev *netdev, const char *name,
     } else if (tap->has_fds) {
         char **fds;
         char **vhost_fds;
-        int nfds, nvhosts;
+        int nfds = 0, nvhosts = 0;
 
         if (tap->has_ifname || tap->has_script || tap->has_downscript ||
             tap->has_vnet_hdr || tap->has_helper || tap->has_queues ||
@@ -823,24 +850,34 @@ int net_init_tap(const Netdev *netdev, const char *name,
             if (nfds != nvhosts) {
                 error_setg(errp, "The number of fds passed does not match "
                            "the number of vhostfds passed");
+                ret = -1;
                 goto free_fail;
             }
         }
 
         for (i = 0; i < nfds; i++) {
-            fd = monitor_fd_param(cur_mon, fds[i], &err);
+            fd = monitor_fd_param(cur_mon, fds[i], errp);
             if (fd == -1) {
-                error_propagate(errp, err);
+                ret = -1;
                 goto free_fail;
             }
 
-            fcntl(fd, F_SETFL, O_NONBLOCK);
+            ret = qemu_try_set_nonblock(fd);
+            if (ret < 0) {
+                error_setg_errno(errp, -ret, "%s: Can't use file descriptor %d",
+                                 name, fd);
+                goto free_fail;
+            }
 
             if (i == 0) {
-                vnet_hdr = tap_probe_vnet_hdr(fd);
-            } else if (vnet_hdr != tap_probe_vnet_hdr(fd)) {
+                vnet_hdr = tap_probe_vnet_hdr(fd, errp);
+                if (vnet_hdr < 0) {
+                    goto free_fail;
+                }
+            } else if (vnet_hdr != tap_probe_vnet_hdr(fd, NULL)) {
                 error_setg(errp,
                            "vnet_hdr not consistent across given tap fds");
+                ret = -1;
                 goto free_fail;
             }
 
@@ -850,21 +887,21 @@ int net_init_tap(const Netdev *netdev, const char *name,
                              vnet_hdr, fd, &err);
             if (err) {
                 error_propagate(errp, err);
+                ret = -1;
                 goto free_fail;
             }
         }
-        g_free(fds);
-        g_free(vhost_fds);
-        return 0;
 
 free_fail:
+        for (i = 0; i < nvhosts; i++) {
+            g_free(vhost_fds[i]);
+        }
         for (i = 0; i < nfds; i++) {
             g_free(fds[i]);
-            g_free(vhost_fds[i]);
         }
         g_free(fds);
         g_free(vhost_fds);
-        return -1;
+        return ret;
     } else if (tap->has_helper) {
         if (tap->has_ifname || tap->has_script || tap->has_downscript ||
             tap->has_vnet_hdr || tap->has_queues || tap->has_vhostfds) {
@@ -881,8 +918,12 @@ free_fail:
             return -1;
         }
 
-        fcntl(fd, F_SETFL, O_NONBLOCK);
-        vnet_hdr = tap_probe_vnet_hdr(fd);
+        qemu_set_nonblock(fd);
+        vnet_hdr = tap_probe_vnet_hdr(fd, errp);
+        if (vnet_hdr < 0) {
+            close(fd);
+            return -1;
+        }
 
         net_init_tap_one(tap, peer, "bridge", name, ifname,
                          script, downscript, vhostfdname,

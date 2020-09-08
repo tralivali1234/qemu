@@ -47,18 +47,23 @@ tpm_be_find_by_type(enum TpmType type)
  */
 static void tpm_display_backend_drivers(void)
 {
+    bool got_one = false;
     int i;
-
-    fprintf(stderr, "Supported TPM types (choose only one):\n");
 
     for (i = 0; i < TPM_TYPE__MAX; i++) {
         const TPMBackendClass *bc = tpm_be_find_by_type(i);
         if (!bc) {
             continue;
         }
-        fprintf(stderr, "%12s   %s\n", TpmType_str(i), bc->desc);
+        if (!got_one) {
+            error_printf("Supported TPM types (choose only one):\n");
+            got_one = true;
+        }
+        error_printf("%12s   %s\n", TpmType_str(i), bc->desc);
     }
-    fprintf(stderr, "\n");
+    if (!got_one) {
+        error_printf("No TPM backend types are available\n");
+    }
 }
 
 /*
@@ -81,6 +86,12 @@ TPMBackend *qemu_find_tpm_be(const char *id)
 
 static int tpm_init_tpmdev(void *dummy, QemuOpts *opts, Error **errp)
 {
+    /*
+     * Use of error_report() in a function with an Error ** parameter
+     * is suspicious.  It is okay here.  The parameter only exists to
+     * make the function usable with qemu_opts_foreach().  It is not
+     * actually used.
+     */
     const char *value;
     const char *id;
     const TPMBackendClass *be;
@@ -116,8 +127,7 @@ static int tpm_init_tpmdev(void *dummy, QemuOpts *opts, Error **errp)
     }
 
     /* validate backend specific opts */
-    qemu_opts_validate(opts, be->opts, &local_err);
-    if (local_err) {
+    if (!qemu_opts_validate(opts, be->opts, &local_err)) {
         error_report_err(local_err);
         return 1;
     }

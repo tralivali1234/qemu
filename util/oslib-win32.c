@@ -29,8 +29,10 @@
  * this file are based on code from GNOME glib-2 and use a different license,
  * see the license comment there.
  */
+
 #include "qemu/osdep.h"
 #include <windows.h>
+#include "qemu-common.h"
 #include "qapi/error.h"
 #include "sysemu/sysemu.h"
 #include "qemu/main-loop.h"
@@ -67,15 +69,24 @@ void *qemu_memalign(size_t alignment, size_t size)
     return qemu_oom_check(qemu_try_memalign(alignment, size));
 }
 
+static int get_allocation_granularity(void)
+{
+    SYSTEM_INFO system_info;
+
+    GetSystemInfo(&system_info);
+    return system_info.dwAllocationGranularity;
+}
+
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared)
 {
     void *ptr;
 
-    /* FIXME: this is not exactly optimal solution since VirtualAlloc
-       has 64Kb granularity, but at least it guarantees us that the
-       memory is page aligned. */
     ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
     trace_qemu_anon_ram_alloc(size, ptr);
+
+    if (ptr && align) {
+        *align = MAX(get_allocation_granularity(), getpagesize());
+    }
     return ptr;
 }
 
@@ -120,31 +131,6 @@ struct tm *localtime_r(const time_t *timep, struct tm *result)
     return p;
 }
 #endif /* CONFIG_LOCALTIME_R */
-
-void qemu_set_block(int fd)
-{
-    unsigned long opt = 0;
-    WSAEventSelect(fd, NULL, 0);
-    ioctlsocket(fd, FIONBIO, &opt);
-}
-
-void qemu_set_nonblock(int fd)
-{
-    unsigned long opt = 1;
-    ioctlsocket(fd, FIONBIO, &opt);
-    qemu_fd_register(fd);
-}
-
-int socket_set_fast_reuse(int fd)
-{
-    /* Enabling the reuse of an endpoint that was used by a socket still in
-     * TIME_WAIT state is usually performed by setting SO_REUSEADDR. On Windows
-     * fast reuse is the default and SO_REUSEADDR does strange things. So we
-     * don't have to do anything here. More info can be found at:
-     * http://msdn.microsoft.com/en-us/library/windows/desktop/ms740621.aspx */
-    return 0;
-}
-
 
 static int socket_error(void)
 {
@@ -220,6 +206,38 @@ static int socket_error(void)
     default:
         return EIO;
     }
+}
+
+void qemu_set_block(int fd)
+{
+    unsigned long opt = 0;
+    WSAEventSelect(fd, NULL, 0);
+    ioctlsocket(fd, FIONBIO, &opt);
+}
+
+int qemu_try_set_nonblock(int fd)
+{
+    unsigned long opt = 1;
+    if (ioctlsocket(fd, FIONBIO, &opt) != NO_ERROR) {
+        return -socket_error();
+    }
+    qemu_fd_register(fd);
+    return 0;
+}
+
+void qemu_set_nonblock(int fd)
+{
+    (void)qemu_try_set_nonblock(fd);
+}
+
+int socket_set_fast_reuse(int fd)
+{
+    /* Enabling the reuse of an endpoint that was used by a socket still in
+     * TIME_WAIT state is usually performed by setting SO_REUSEADDR. On Windows
+     * fast reuse is the default and SO_REUSEADDR does strange things. So we
+     * don't have to do anything here. More info can be found at:
+     * http://msdn.microsoft.com/en-us/library/windows/desktop/ms740621.aspx */
+    return 0;
 }
 
 int inet_aton(const char *cp, struct in_addr *ia)
@@ -543,14 +561,13 @@ void os_mem_prealloc(int fd, char *area, size_t memory, int smp_cpus,
                      Error **errp)
 {
     int i;
-    size_t pagesize = getpagesize();
+    size_t pagesize = qemu_real_host_page_size;
 
     memory = (memory + pagesize - 1) & -pagesize;
     for (i = 0; i < memory / pagesize; i++) {
         memset(area + pagesize * i, 0, 1);
     }
 }
-
 
 char *qemu_get_pid_name(pid_t pid)
 {
@@ -575,7 +592,11 @@ int qemu_connect_wrap(int sockfd, const struct sockaddr *addr,
     int ret;
     ret = connect(sockfd, addr, addrlen);
     if (ret < 0) {
-        errno = socket_error();
+        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            errno = EINPROGRESS;
+        } else {
+            errno = socket_error();
+        }
     }
     return ret;
 }
@@ -766,4 +787,55 @@ ssize_t qemu_recvfrom_wrap(int sockfd, void *buf, size_t len, int flags,
         errno = socket_error();
     }
     return ret;
+}
+
+bool qemu_write_pidfile(const char *filename, Error **errp)
+{
+    char buffer[128];
+    int len;
+    HANDLE file;
+    OVERLAPPED overlap;
+    BOOL ret;
+    memset(&overlap, 0, sizeof(overlap));
+
+    file = CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (file == INVALID_HANDLE_VALUE) {
+        error_setg(errp, "Failed to create PID file");
+        return false;
+    }
+    len = snprintf(buffer, sizeof(buffer), FMT_pid "\n", (pid_t)getpid());
+    ret = WriteFile(file, (LPCVOID)buffer, (DWORD)len,
+                    NULL, &overlap);
+    CloseHandle(file);
+    if (ret == 0) {
+        error_setg(errp, "Failed to write PID file");
+        return false;
+    }
+    return true;
+}
+
+char *qemu_get_host_name(Error **errp)
+{
+    wchar_t tmp[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD size = G_N_ELEMENTS(tmp);
+
+    if (GetComputerNameW(tmp, &size) == 0) {
+        error_setg_win32(errp, GetLastError(), "failed close handle");
+        return NULL;
+    }
+
+    return g_utf16_to_utf8(tmp, size, NULL, NULL, NULL);
+}
+
+size_t qemu_get_host_physmem(void)
+{
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+
+    if (GlobalMemoryStatusEx(&statex)) {
+        return statex.ullTotalPhys;
+    }
+    return 0;
 }

@@ -17,7 +17,6 @@
 #define QEMU_VIRTIO_SERIAL_H
 
 #include "standard-headers/linux/virtio_console.h"
-#include "hw/qdev.h"
 #include "hw/virtio/virtio.h"
 
 struct virtio_serial_conf {
@@ -34,7 +33,12 @@ struct virtio_serial_conf {
      OBJECT_GET_CLASS(VirtIOSerialPortClass, (obj), TYPE_VIRTIO_SERIAL_PORT)
 
 typedef struct VirtIOSerial VirtIOSerial;
+
+#define TYPE_VIRTIO_SERIAL_BUS "virtio-serial-bus"
 typedef struct VirtIOSerialBus VirtIOSerialBus;
+#define VIRTIO_SERIAL_BUS(obj) \
+      OBJECT_CHECK(VirtIOSerialBus, (obj), TYPE_VIRTIO_SERIAL_BUS)
+
 typedef struct VirtIOSerialPort VirtIOSerialPort;
 
 typedef struct VirtIOSerialPortClass {

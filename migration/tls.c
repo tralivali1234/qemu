@@ -58,7 +58,6 @@ migration_tls_get_creds(MigrationState *s,
         return NULL;
     }
 
-    object_ref(OBJECT(ret));
     return ret;
 }
 
@@ -94,7 +93,7 @@ void migration_tls_channel_process_incoming(MigrationState *s,
 
     tioc = qio_channel_tls_new_server(
         ioc, creds,
-        NULL, /* XXX pass ACL name */
+        s->parameters.tls_authz,
         errp);
     if (!tioc) {
         return;

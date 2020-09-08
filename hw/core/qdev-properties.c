@@ -1,16 +1,21 @@
 #include "qemu/osdep.h"
 #include "net/net.h"
-#include "hw/qdev.h"
+#include "hw/qdev-properties.h"
 #include "qapi/error.h"
 #include "hw/pci/pci.h"
+#include "qapi/qapi-types-block.h"
+#include "qapi/qapi-types-misc.h"
 #include "qapi/qmp/qerror.h"
+#include "qemu/ctype.h"
 #include "qemu/error-report.h"
-#include "sysemu/block-backend.h"
+#include "qapi/qapi-types-migration.h"
 #include "hw/block/block.h"
 #include "net/hub.h"
 #include "qapi/visitor.h"
 #include "chardev/char.h"
 #include "qemu/uuid.h"
+#include "qemu/units.h"
+#include "qemu/cutils.h"
 
 void qdev_prop_set_after_realize(DeviceState *dev, const char *name,
                                   Error **errp)
@@ -71,12 +76,10 @@ static void set_enum(Object *obj, Visitor *v, const char *name, void *opaque,
     visit_type_enum(v, prop->name, ptr, prop->info->enum_table, errp);
 }
 
-static void set_default_value_enum(Object *obj, const Property *prop)
+static void set_default_value_enum(ObjectProperty *op, const Property *prop)
 {
-    object_property_set_str(obj,
-                            qapi_enum_lookup(prop->info->enum_table,
-                                             prop->defval.i),
-                            prop->name, &error_abort);
+    object_property_set_default_str(op,
+        qapi_enum_lookup(prop->info->enum_table, prop->defval.i));
 }
 
 /* Bit */
@@ -114,7 +117,6 @@ static void prop_set_bit(Object *obj, Visitor *v, const char *name,
 {
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
-    Error *local_err = NULL;
     bool value;
 
     if (dev->realized) {
@@ -122,17 +124,15 @@ static void prop_set_bit(Object *obj, Visitor *v, const char *name,
         return;
     }
 
-    visit_type_bool(v, name, &value, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_bool(v, name, &value, errp)) {
         return;
     }
     bit_prop_set(dev, prop, value);
 }
 
-static void set_default_value_bool(Object *obj, const Property *prop)
+static void set_default_value_bool(ObjectProperty *op, const Property *prop)
 {
-    object_property_set_bool(obj, prop->defval.u, prop->name, &error_abort);
+    object_property_set_default_bool(op, prop->defval.u);
 }
 
 const PropertyInfo qdev_prop_bit = {
@@ -178,7 +178,6 @@ static void prop_set_bit64(Object *obj, Visitor *v, const char *name,
 {
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
-    Error *local_err = NULL;
     bool value;
 
     if (dev->realized) {
@@ -186,9 +185,7 @@ static void prop_set_bit64(Object *obj, Visitor *v, const char *name,
         return;
     }
 
-    visit_type_bool(v, name, &value, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_bool(v, name, &value, errp)) {
         return;
     }
     bit64_prop_set(dev, prop, value);
@@ -263,14 +260,14 @@ static void set_uint8(Object *obj, Visitor *v, const char *name, void *opaque,
     visit_type_uint8(v, name, ptr, errp);
 }
 
-static void set_default_value_int(Object *obj, const Property *prop)
+static void set_default_value_int(ObjectProperty *op, const Property *prop)
 {
-    object_property_set_int(obj, prop->defval.i, prop->name, &error_abort);
+    object_property_set_default_int(op, prop->defval.i);
 }
 
-static void set_default_value_uint(Object *obj, const Property *prop)
+static void set_default_value_uint(ObjectProperty *op, const Property *prop)
 {
-    object_property_set_uint(obj, prop->defval.u, prop->name, &error_abort);
+    object_property_set_default_uint(op, prop->defval.u);
 }
 
 const PropertyInfo qdev_prop_uint8 = {
@@ -475,7 +472,6 @@ static void set_string(Object *obj, Visitor *v, const char *name,
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
     char **ptr = qdev_get_prop_ptr(dev, prop);
-    Error *local_err = NULL;
     char *str;
 
     if (dev->realized) {
@@ -483,9 +479,7 @@ static void set_string(Object *obj, Visitor *v, const char *name,
         return;
     }
 
-    visit_type_str(v, name, &str, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_str(v, name, &str, errp)) {
         return;
     }
     g_free(*ptr);
@@ -497,13 +491,6 @@ const PropertyInfo qdev_prop_string = {
     .release = release_string,
     .get   = get_string,
     .set   = set_string,
-};
-
-/* --- pointer --- */
-
-/* Not a proper property, just for dirty hacks.  TODO Remove it!  */
-const PropertyInfo qdev_prop_ptr = {
-    .name  = "ptr",
 };
 
 /* --- mac address --- */
@@ -535,7 +522,6 @@ static void set_mac(Object *obj, Visitor *v, const char *name, void *opaque,
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
     MACAddr *mac = qdev_get_prop_ptr(dev, prop);
-    Error *local_err = NULL;
     int i, pos;
     char *str, *p;
 
@@ -544,9 +530,7 @@ static void set_mac(Object *obj, Visitor *v, const char *name, void *opaque,
         return;
     }
 
-    visit_type_str(v, name, &str, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_str(v, name, &str, errp)) {
         return;
     }
 
@@ -581,6 +565,94 @@ const PropertyInfo qdev_prop_macaddr = {
     .description = "Ethernet 6-byte MAC Address, example: 52:54:00:12:34:56",
     .get   = get_mac,
     .set   = set_mac,
+};
+
+/* --- Reserved Region --- */
+
+/*
+ * Accepted syntax:
+ *   <low address>:<high address>:<type>
+ *   where low/high addresses are uint64_t in hexadecimal
+ *   and type is a non-negative decimal integer
+ */
+static void get_reserved_region(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    ReservedRegion *rr = qdev_get_prop_ptr(dev, prop);
+    char buffer[64];
+    char *p = buffer;
+    int rc;
+
+    rc = snprintf(buffer, sizeof(buffer), "0x%"PRIx64":0x%"PRIx64":%u",
+                  rr->low, rr->high, rr->type);
+    assert(rc < sizeof(buffer));
+
+    visit_type_str(v, name, &p, errp);
+}
+
+static void set_reserved_region(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    ReservedRegion *rr = qdev_get_prop_ptr(dev, prop);
+    Error *local_err = NULL;
+    const char *endptr;
+    char *str;
+    int ret;
+
+    if (dev->realized) {
+        qdev_prop_set_after_realize(dev, name, errp);
+        return;
+    }
+
+    visit_type_str(v, name, &str, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
+    ret = qemu_strtou64(str, &endptr, 16, &rr->low);
+    if (ret) {
+        error_setg(errp, "start address of '%s'"
+                   " must be a hexadecimal integer", name);
+        goto out;
+    }
+    if (*endptr != ':') {
+        goto separator_error;
+    }
+
+    ret = qemu_strtou64(endptr + 1, &endptr, 16, &rr->high);
+    if (ret) {
+        error_setg(errp, "end address of '%s'"
+                   " must be a hexadecimal integer", name);
+        goto out;
+    }
+    if (*endptr != ':') {
+        goto separator_error;
+    }
+
+    ret = qemu_strtoui(endptr + 1, &endptr, 10, &rr->type);
+    if (ret) {
+        error_setg(errp, "type of '%s'"
+                   " must be a non-negative decimal integer", name);
+    }
+    goto out;
+
+separator_error:
+    error_setg(errp, "reserved region fields must be separated with ':'");
+out:
+    g_free(str);
+    return;
+}
+
+const PropertyInfo qdev_prop_reserved_region = {
+    .name  = "reserved_region",
+    .description = "Reserved Region, example: 0xFEE00000:0xFEEFFFFF:0",
+    .get   = get_reserved_region,
+    .set   = set_reserved_region,
 };
 
 /* --- on/off/auto --- */
@@ -646,6 +718,18 @@ const PropertyInfo qdev_prop_fdc_drive_type = {
     .set_default_value = set_default_value_enum,
 };
 
+/* --- MultiFDCompression --- */
+
+const PropertyInfo qdev_prop_multifd_compression = {
+    .name = "MultiFDCompression",
+    .description = "multifd_compression values, "
+                   "none/zlib/zstd",
+    .enum_table = &MultiFDCompression_lookup,
+    .get = get_enum,
+    .set = set_enum,
+    .set_default_value = set_default_value_enum,
+};
+
 /* --- pci address --- */
 
 /*
@@ -658,7 +742,6 @@ static void set_pci_devfn(Object *obj, Visitor *v, const char *name,
     Property *prop = opaque;
     int32_t value, *ptr = qdev_get_prop_ptr(dev, prop);
     unsigned int slot, fn, n;
-    Error *local_err = NULL;
     char *str;
 
     if (dev->realized) {
@@ -666,19 +749,16 @@ static void set_pci_devfn(Object *obj, Visitor *v, const char *name,
         return;
     }
 
-    visit_type_str(v, name, &str, &local_err);
-    if (local_err) {
-        error_free(local_err);
-        local_err = NULL;
-        visit_type_int32(v, name, &value, &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-        } else if (value < -1 || value > 255) {
+    if (!visit_type_str(v, name, &str, NULL)) {
+        if (!visit_type_int32(v, name, &value, errp)) {
+            return;
+        }
+        if (value < -1 || value > 255) {
             error_setg(errp, QERR_INVALID_PARAMETER_VALUE,
                        name ? name : "null", "pci_devfn");
-        } else {
-            *ptr = value;
+            return;
         }
+        *ptr = value;
         return;
     }
 
@@ -721,32 +801,89 @@ const PropertyInfo qdev_prop_pci_devfn = {
     .set_default_value = set_default_value_int,
 };
 
-/* --- blocksize --- */
+/* --- 32bit unsigned int 'size' type --- */
 
-static void set_blocksize(Object *obj, Visitor *v, const char *name,
-                          void *opaque, Error **errp)
+static void get_size32(Object *obj, Visitor *v, const char *name, void *opaque,
+                       Error **errp)
 {
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
-    uint16_t value, *ptr = qdev_get_prop_ptr(dev, prop);
-    Error *local_err = NULL;
-    const int64_t min = 512;
-    const int64_t max = 32768;
+    uint32_t *ptr = qdev_get_prop_ptr(dev, prop);
+    uint64_t value = *ptr;
+
+    visit_type_size(v, name, &value, errp);
+}
+
+static void set_size32(Object *obj, Visitor *v, const char *name, void *opaque,
+                       Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    uint32_t *ptr = qdev_get_prop_ptr(dev, prop);
+    uint64_t value;
 
     if (dev->realized) {
         qdev_prop_set_after_realize(dev, name, errp);
         return;
     }
 
-    visit_type_uint16(v, name, &value, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_size(v, name, &value, errp)) {
+        return;
+    }
+
+    if (value > UINT32_MAX) {
+        error_setg(errp,
+                   "Property %s.%s doesn't take value %" PRIu64
+                   " (maximum: %u)",
+                   dev->id ? : "", name, value, UINT32_MAX);
+        return;
+    }
+
+    *ptr = value;
+}
+
+const PropertyInfo qdev_prop_size32 = {
+    .name  = "size",
+    .get = get_size32,
+    .set = set_size32,
+    .set_default_value = set_default_value_uint,
+};
+
+/* --- blocksize --- */
+
+/* lower limit is sector size */
+#define MIN_BLOCK_SIZE          512
+#define MIN_BLOCK_SIZE_STR      "512 B"
+/*
+ * upper limit is arbitrary, 2 MiB looks sufficient for all sensible uses, and
+ * matches qcow2 cluster size limit
+ */
+#define MAX_BLOCK_SIZE          (2 * MiB)
+#define MAX_BLOCK_SIZE_STR      "2 MiB"
+
+static void set_blocksize(Object *obj, Visitor *v, const char *name,
+                          void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    uint32_t *ptr = qdev_get_prop_ptr(dev, prop);
+    uint64_t value;
+
+    if (dev->realized) {
+        qdev_prop_set_after_realize(dev, name, errp);
+        return;
+    }
+
+    if (!visit_type_size(v, name, &value, errp)) {
         return;
     }
     /* value of 0 means "unset" */
-    if (value && (value < min || value > max)) {
-        error_setg(errp, QERR_PROPERTY_VALUE_OUT_OF_RANGE,
-                   dev->id ? : "", name, (int64_t)value, min, max);
+    if (value && (value < MIN_BLOCK_SIZE || value > MAX_BLOCK_SIZE)) {
+        error_setg(errp,
+                   "Property %s.%s doesn't take value %" PRIu64
+                   " (minimum: " MIN_BLOCK_SIZE_STR
+                   ", maximum: " MAX_BLOCK_SIZE_STR ")",
+                   dev->id ? : "", name, value);
         return;
     }
 
@@ -762,9 +899,10 @@ static void set_blocksize(Object *obj, Visitor *v, const char *name,
 }
 
 const PropertyInfo qdev_prop_blocksize = {
-    .name  = "uint16",
-    .description = "A power of two between 512 and 32768",
-    .get   = get_uint16,
+    .name  = "size",
+    .description = "A power of two between " MIN_BLOCK_SIZE_STR
+                   " and " MAX_BLOCK_SIZE_STR,
+    .get   = get_size32,
     .set   = set_blocksize,
     .set_default_value = set_default_value_uint,
 };
@@ -804,7 +942,6 @@ static void set_pci_host_devaddr(Object *obj, Visitor *v, const char *name,
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
     PCIHostDeviceAddress *addr = qdev_get_prop_ptr(dev, prop);
-    Error *local_err = NULL;
     char *str, *p;
     char *e;
     unsigned long val;
@@ -816,9 +953,7 @@ static void set_pci_host_devaddr(Object *obj, Visitor *v, const char *name,
         return;
     }
 
-    visit_type_str(v, name, &str, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_str(v, name, &str, errp)) {
         return;
     }
 
@@ -908,7 +1043,6 @@ static void set_uuid(Object *obj, Visitor *v, const char *name, void *opaque,
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
     QemuUUID *uuid = qdev_get_prop_ptr(dev, prop);
-    Error *local_err = NULL;
     char *str;
 
     if (dev->realized) {
@@ -916,9 +1050,7 @@ static void set_uuid(Object *obj, Visitor *v, const char *name, void *opaque,
         return;
     }
 
-    visit_type_str(v, name, &str, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_str(v, name, &str, errp)) {
         return;
     }
 
@@ -930,9 +1062,9 @@ static void set_uuid(Object *obj, Visitor *v, const char *name, void *opaque,
     g_free(str);
 }
 
-static void set_default_uuid_auto(Object *obj, const Property *prop)
+static void set_default_uuid_auto(ObjectProperty *op, const Property *prop)
 {
-    object_property_set_str(obj, UUID_VALUE_AUTO, prop->name, &error_abort);
+    object_property_set_default_str(op, UUID_VALUE_AUTO);
 }
 
 const PropertyInfo qdev_prop_uuid = {
@@ -984,7 +1116,6 @@ static void set_prop_arraylen(Object *obj, Visitor *v, const char *name,
     Property *prop = opaque;
     uint32_t *alenptr = qdev_get_prop_ptr(dev, prop);
     void **arrayptr = (void *)dev + prop->arrayoffset;
-    Error *local_err = NULL;
     void *eltptr;
     const char *arrayname;
     int i;
@@ -998,9 +1129,7 @@ static void set_prop_arraylen(Object *obj, Visitor *v, const char *name,
                    name);
         return;
     }
-    visit_type_uint32(v, name, alenptr, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_uint32(v, name, alenptr, errp)) {
         return;
     }
     if (!*alenptr) {
@@ -1037,11 +1166,7 @@ static void set_prop_arraylen(Object *obj, Visitor *v, const char *name,
                             arrayprop->prop.info->get,
                             arrayprop->prop.info->set,
                             array_element_release,
-                            arrayprop, &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
-        }
+                            arrayprop);
     }
 }
 
@@ -1076,7 +1201,7 @@ static Property *qdev_prop_find(DeviceState *dev, const char *name)
     /* device properties */
     class = object_get_class(OBJECT(dev));
     do {
-        prop = qdev_prop_walk(DEVICE_CLASS(class)->props, name);
+        prop = qdev_prop_walk(DEVICE_CLASS(class)->props_, name);
         if (prop) {
             return prop;
         }
@@ -1110,37 +1235,37 @@ void error_set_from_qdev_prop_error(Error **errp, int ret, DeviceState *dev,
 
 void qdev_prop_set_bit(DeviceState *dev, const char *name, bool value)
 {
-    object_property_set_bool(OBJECT(dev), value, name, &error_abort);
+    object_property_set_bool(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_uint8(DeviceState *dev, const char *name, uint8_t value)
 {
-    object_property_set_int(OBJECT(dev), value, name, &error_abort);
+    object_property_set_int(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_uint16(DeviceState *dev, const char *name, uint16_t value)
 {
-    object_property_set_int(OBJECT(dev), value, name, &error_abort);
+    object_property_set_int(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_uint32(DeviceState *dev, const char *name, uint32_t value)
 {
-    object_property_set_int(OBJECT(dev), value, name, &error_abort);
+    object_property_set_int(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_int32(DeviceState *dev, const char *name, int32_t value)
 {
-    object_property_set_int(OBJECT(dev), value, name, &error_abort);
+    object_property_set_int(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_uint64(DeviceState *dev, const char *name, uint64_t value)
 {
-    object_property_set_int(OBJECT(dev), value, name, &error_abort);
+    object_property_set_int(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_string(DeviceState *dev, const char *name, const char *value)
 {
-    object_property_set_str(OBJECT(dev), value, name, &error_abort);
+    object_property_set_str(OBJECT(dev), name, value, &error_abort);
 }
 
 void qdev_prop_set_macaddr(DeviceState *dev, const char *name,
@@ -1150,7 +1275,7 @@ void qdev_prop_set_macaddr(DeviceState *dev, const char *name,
     snprintf(str, sizeof(str), "%02x:%02x:%02x:%02x:%02x:%02x",
              value[0], value[1], value[2], value[3], value[4], value[5]);
 
-    object_property_set_str(OBJECT(dev), str, name, &error_abort);
+    object_property_set_str(OBJECT(dev), name, str, &error_abort);
 }
 
 void qdev_prop_set_enum(DeviceState *dev, const char *name, int value)
@@ -1158,72 +1283,55 @@ void qdev_prop_set_enum(DeviceState *dev, const char *name, int value)
     Property *prop;
 
     prop = qdev_prop_find(dev, name);
-    object_property_set_str(OBJECT(dev),
+    object_property_set_str(OBJECT(dev), name,
                             qapi_enum_lookup(prop->info->enum_table, value),
-                            name, &error_abort);
+                            &error_abort);
 }
 
-void qdev_prop_set_ptr(DeviceState *dev, const char *name, void *value)
+static GPtrArray *global_props(void)
 {
-    Property *prop;
-    void **ptr;
+    static GPtrArray *gp;
 
-    prop = qdev_prop_find(dev, name);
-    assert(prop && prop->info == &qdev_prop_ptr);
-    ptr = qdev_get_prop_ptr(dev, prop);
-    *ptr = value;
+    if (!gp) {
+        gp = g_ptr_array_new();
+    }
+
+    return gp;
 }
-
-static GList *global_props;
 
 void qdev_prop_register_global(GlobalProperty *prop)
 {
-    global_props = g_list_append(global_props, prop);
+    g_ptr_array_add(global_props(), prop);
 }
 
-void register_compat_prop(const char *driver,
-                          const char *property,
-                          const char *value)
+const GlobalProperty *qdev_find_global_prop(DeviceState *dev,
+                                            const char *name)
 {
-    GlobalProperty *p = g_new0(GlobalProperty, 1);
-
-    /* Any compat_props must never cause error */
-    p->errp = &error_abort;
-    p->driver = driver;
-    p->property = property;
-    p->value = value;
-    qdev_prop_register_global(p);
-}
-
-void register_compat_props_array(GlobalProperty *prop)
-{
-    for (; prop && prop->driver; prop++) {
-        register_compat_prop(prop->driver, prop->property, prop->value);
-    }
-}
-
-void qdev_prop_register_global_list(GlobalProperty *props)
-{
+    GPtrArray *props = global_props();
+    const GlobalProperty *p;
     int i;
 
-    for (i = 0; props[i].driver != NULL; i++) {
-        qdev_prop_register_global(props+i);
+    for (i = 0; i < props->len; i++) {
+        p = g_ptr_array_index(props, i);
+        if (object_dynamic_cast(OBJECT(dev), p->driver)
+            && !strcmp(p->property, name)) {
+            return p;
+        }
     }
+    return NULL;
 }
 
 int qdev_prop_check_globals(void)
 {
-    GList *l;
-    int ret = 0;
+    int i, ret = 0;
 
-    for (l = global_props; l; l = l->next) {
-        GlobalProperty *prop = l->data;
+    for (i = 0; i < global_props()->len; i++) {
+        GlobalProperty *prop;
         ObjectClass *oc;
         DeviceClass *dc;
+
+        prop = g_ptr_array_index(global_props(), i);
         if (prop->used) {
-            continue;
-        }
-        if (!prop->user_provided) {
             continue;
         }
         oc = object_class_by_name(prop->driver);
@@ -1247,28 +1355,8 @@ int qdev_prop_check_globals(void)
 
 void qdev_prop_set_globals(DeviceState *dev)
 {
-    GList *l;
-
-    for (l = global_props; l; l = l->next) {
-        GlobalProperty *prop = l->data;
-        Error *err = NULL;
-
-        if (object_dynamic_cast(OBJECT(dev), prop->driver) == NULL) {
-            continue;
-        }
-        prop->used = true;
-        object_property_parse(OBJECT(dev), prop->value, prop->property, &err);
-        if (err != NULL) {
-            error_prepend(&err, "can't apply global %s.%s=%s: ",
-                          prop->driver, prop->property, prop->value);
-            if (!dev->hotplugged && prop->errp) {
-                error_propagate(prop->errp, err);
-            } else {
-                assert(prop->user_provided);
-                warn_report_err(err);
-            }
-        }
-    }
+    object_apply_global_props(OBJECT(dev), global_props(),
+                              dev->hotplugged ? NULL : &error_fatal);
 }
 
 /* --- 64bit unsigned int 'size' type --- */
@@ -1302,15 +1390,12 @@ const PropertyInfo qdev_prop_size = {
 
 /* --- object link property --- */
 
-static void create_link_property(Object *obj, Property *prop, Error **errp)
+static void create_link_property(ObjectClass *oc, Property *prop)
 {
-    Object **child = qdev_get_prop_ptr(DEVICE(obj), prop);
-
-    object_property_add_link(obj, prop->name, prop->link_type,
-                             child,
-                             qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             errp);
+    object_class_property_add_link(oc, prop->name, prop->link_type,
+                                   prop->offset,
+                                   qdev_prop_allow_set_link_before_realize,
+                                   OBJ_PROP_LINK_STRONG);
 }
 
 const PropertyInfo qdev_prop_link = {
@@ -1326,5 +1411,177 @@ const PropertyInfo qdev_prop_off_auto_pcibar = {
     .enum_table = &OffAutoPCIBAR_lookup,
     .get = get_enum,
     .set = set_enum,
+    .set_default_value = set_default_value_enum,
+};
+
+/* --- PCIELinkSpeed 2_5/5/8/16 -- */
+
+static void get_prop_pcielinkspeed(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    PCIExpLinkSpeed *p = qdev_get_prop_ptr(dev, prop);
+    int speed;
+
+    switch (*p) {
+    case QEMU_PCI_EXP_LNK_2_5GT:
+        speed = PCIE_LINK_SPEED_2_5;
+        break;
+    case QEMU_PCI_EXP_LNK_5GT:
+        speed = PCIE_LINK_SPEED_5;
+        break;
+    case QEMU_PCI_EXP_LNK_8GT:
+        speed = PCIE_LINK_SPEED_8;
+        break;
+    case QEMU_PCI_EXP_LNK_16GT:
+        speed = PCIE_LINK_SPEED_16;
+        break;
+    default:
+        /* Unreachable */
+        abort();
+    }
+
+    visit_type_enum(v, prop->name, &speed, prop->info->enum_table, errp);
+}
+
+static void set_prop_pcielinkspeed(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    PCIExpLinkSpeed *p = qdev_get_prop_ptr(dev, prop);
+    int speed;
+
+    if (dev->realized) {
+        qdev_prop_set_after_realize(dev, name, errp);
+        return;
+    }
+
+    if (!visit_type_enum(v, prop->name, &speed, prop->info->enum_table,
+                         errp)) {
+        return;
+    }
+
+    switch (speed) {
+    case PCIE_LINK_SPEED_2_5:
+        *p = QEMU_PCI_EXP_LNK_2_5GT;
+        break;
+    case PCIE_LINK_SPEED_5:
+        *p = QEMU_PCI_EXP_LNK_5GT;
+        break;
+    case PCIE_LINK_SPEED_8:
+        *p = QEMU_PCI_EXP_LNK_8GT;
+        break;
+    case PCIE_LINK_SPEED_16:
+        *p = QEMU_PCI_EXP_LNK_16GT;
+        break;
+    default:
+        /* Unreachable */
+        abort();
+    }
+}
+
+const PropertyInfo qdev_prop_pcie_link_speed = {
+    .name = "PCIELinkSpeed",
+    .description = "2_5/5/8/16",
+    .enum_table = &PCIELinkSpeed_lookup,
+    .get = get_prop_pcielinkspeed,
+    .set = set_prop_pcielinkspeed,
+    .set_default_value = set_default_value_enum,
+};
+
+/* --- PCIELinkWidth 1/2/4/8/12/16/32 -- */
+
+static void get_prop_pcielinkwidth(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    PCIExpLinkWidth *p = qdev_get_prop_ptr(dev, prop);
+    int width;
+
+    switch (*p) {
+    case QEMU_PCI_EXP_LNK_X1:
+        width = PCIE_LINK_WIDTH_1;
+        break;
+    case QEMU_PCI_EXP_LNK_X2:
+        width = PCIE_LINK_WIDTH_2;
+        break;
+    case QEMU_PCI_EXP_LNK_X4:
+        width = PCIE_LINK_WIDTH_4;
+        break;
+    case QEMU_PCI_EXP_LNK_X8:
+        width = PCIE_LINK_WIDTH_8;
+        break;
+    case QEMU_PCI_EXP_LNK_X12:
+        width = PCIE_LINK_WIDTH_12;
+        break;
+    case QEMU_PCI_EXP_LNK_X16:
+        width = PCIE_LINK_WIDTH_16;
+        break;
+    case QEMU_PCI_EXP_LNK_X32:
+        width = PCIE_LINK_WIDTH_32;
+        break;
+    default:
+        /* Unreachable */
+        abort();
+    }
+
+    visit_type_enum(v, prop->name, &width, prop->info->enum_table, errp);
+}
+
+static void set_prop_pcielinkwidth(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    DeviceState *dev = DEVICE(obj);
+    Property *prop = opaque;
+    PCIExpLinkWidth *p = qdev_get_prop_ptr(dev, prop);
+    int width;
+
+    if (dev->realized) {
+        qdev_prop_set_after_realize(dev, name, errp);
+        return;
+    }
+
+    if (!visit_type_enum(v, prop->name, &width, prop->info->enum_table,
+                         errp)) {
+        return;
+    }
+
+    switch (width) {
+    case PCIE_LINK_WIDTH_1:
+        *p = QEMU_PCI_EXP_LNK_X1;
+        break;
+    case PCIE_LINK_WIDTH_2:
+        *p = QEMU_PCI_EXP_LNK_X2;
+        break;
+    case PCIE_LINK_WIDTH_4:
+        *p = QEMU_PCI_EXP_LNK_X4;
+        break;
+    case PCIE_LINK_WIDTH_8:
+        *p = QEMU_PCI_EXP_LNK_X8;
+        break;
+    case PCIE_LINK_WIDTH_12:
+        *p = QEMU_PCI_EXP_LNK_X12;
+        break;
+    case PCIE_LINK_WIDTH_16:
+        *p = QEMU_PCI_EXP_LNK_X16;
+        break;
+    case PCIE_LINK_WIDTH_32:
+        *p = QEMU_PCI_EXP_LNK_X32;
+        break;
+    default:
+        /* Unreachable */
+        abort();
+    }
+}
+
+const PropertyInfo qdev_prop_pcie_link_width = {
+    .name = "PCIELinkWidth",
+    .description = "1/2/4/8/12/16/32",
+    .enum_table = &PCIELinkWidth_lookup,
+    .get = get_prop_pcielinkwidth,
+    .set = set_prop_pcielinkwidth,
     .set_default_value = set_default_value_enum,
 };

@@ -35,7 +35,9 @@ typedef struct {
 
 /* ARMv7M container object.
  * + Unnamed GPIO input lines: external IRQ lines for the NVIC
- * + Named GPIO output SYSRESETREQ: signalled for guest AIRCR.SYSRESETREQ
+ * + Named GPIO output SYSRESETREQ: signalled for guest AIRCR.SYSRESETREQ.
+ *   If this GPIO is not wired up then the NVIC will default to performing
+ *   a qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET).
  * + Property "cpu-type": CPU type to instantiate
  * + Property "num-irq": number of external IRQ lines
  * + Property "memory": MemoryRegion defining the physical address space
@@ -43,6 +45,9 @@ typedef struct {
  *   devices will be automatically layered on top of this view.)
  * + Property "idau": IDAU interface (forwarded to CPU object)
  * + Property "init-svtor": secure VTOR reset value (forwarded to CPU object)
+ * + Property "vfp": enable VFP (forwarded to CPU object)
+ * + Property "dsp": enable DSP (forwarded to CPU object)
+ * + Property "enable-bitband": expose bitbanded IO
  */
 typedef struct ARMv7MState {
     /*< private >*/
@@ -63,6 +68,10 @@ typedef struct ARMv7MState {
     MemoryRegion *board_memory;
     Object *idau;
     uint32_t init_svtor;
+    bool enable_bitband;
+    bool start_powered_off;
+    bool vfp;
+    bool dsp;
 } ARMv7MState;
 
 #endif

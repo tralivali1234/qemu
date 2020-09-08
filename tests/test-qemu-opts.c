@@ -8,7 +8,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/cutils.h"
+#include "qemu/units.h"
 #include "qemu/option.h"
 #include "qemu/option_int.h"
 #include "qapi/error.h"
@@ -187,7 +187,6 @@ static void test_qemu_opt_get(void)
 
 static void test_qemu_opt_get_bool(void)
 {
-    Error *err = NULL;
     QemuOptsList *list;
     QemuOpts *opts;
     bool opt;
@@ -210,16 +209,14 @@ static void test_qemu_opt_get_bool(void)
     opt = qemu_opt_get_bool(opts, "bool1", false);
     g_assert(opt == false);
 
-    qemu_opt_set_bool(opts, "bool1", true, &err);
-    g_assert(!err);
+    qemu_opt_set_bool(opts, "bool1", true, &error_abort);
 
     /* now we have set bool1, should know about it */
     opt = qemu_opt_get_bool(opts, "bool1", false);
     g_assert(opt == true);
 
     /* having reset the value, opt should be the reset one not defval */
-    qemu_opt_set_bool(opts, "bool1", false, &err);
-    g_assert(!err);
+    qemu_opt_set_bool(opts, "bool1", false, &error_abort);
 
     opt = qemu_opt_get_bool(opts, "bool1", true);
     g_assert(opt == false);
@@ -233,7 +230,6 @@ static void test_qemu_opt_get_bool(void)
 
 static void test_qemu_opt_get_number(void)
 {
-    Error *err = NULL;
     QemuOptsList *list;
     QemuOpts *opts;
     uint64_t opt;
@@ -256,16 +252,14 @@ static void test_qemu_opt_get_number(void)
     opt = qemu_opt_get_number(opts, "number1", 5);
     g_assert(opt == 5);
 
-    qemu_opt_set_number(opts, "number1", 10, &err);
-    g_assert(!err);
+    qemu_opt_set_number(opts, "number1", 10, &error_abort);
 
     /* now we have set number1, should know about it */
     opt = qemu_opt_get_number(opts, "number1", 5);
     g_assert(opt == 10);
 
     /* having reset it, the returned should be the reset one not defval */
-    qemu_opt_set_number(opts, "number1", 15, &err);
-    g_assert(!err);
+    qemu_opt_set_number(opts, "number1", 15, &error_abort);
 
     opt = qemu_opt_get_number(opts, "number1", 5);
     g_assert(opt == 15);
@@ -367,7 +361,6 @@ static void test_qemu_opt_unset(void)
 
 static void test_qemu_opts_reset(void)
 {
-    Error *err = NULL;
     QemuOptsList *list;
     QemuOpts *opts;
     uint64_t opt;
@@ -390,8 +383,7 @@ static void test_qemu_opts_reset(void)
     opt = qemu_opt_get_number(opts, "number1", 5);
     g_assert(opt == 5);
 
-    qemu_opt_set_number(opts, "number1", 10, &err);
-    g_assert(!err);
+    qemu_opt_set_number(opts, "number1", 10, &error_abort);
 
     /* now we have set number1, should know about it */
     opt = qemu_opt_get_number(opts, "number1", 5);
@@ -406,7 +398,6 @@ static void test_qemu_opts_reset(void)
 
 static void test_qemu_opts_set(void)
 {
-    Error *err = NULL;
     QemuOptsList *list;
     QemuOpts *opts;
     const char *opt;
@@ -421,8 +412,7 @@ static void test_qemu_opts_set(void)
     g_assert(opts == NULL);
 
     /* implicitly create opts and set str3 value */
-    qemu_opts_set(list, NULL, "str3", "value", &err);
-    g_assert(!err);
+    qemu_opts_set(list, NULL, "str3", "value", &error_abort);
     g_assert(!QTAILQ_EMPTY(&list->head));
 
     /* get the just created opts */
@@ -459,8 +449,6 @@ static void test_opts_parse(void)
 {
     Error *err = NULL;
     QemuOpts *opts;
-    char long_key[129];
-    char *params;
 
     /* Nothing */
     opts = qemu_opts_parse(&opts_list_03, "", false, &error_abort);
@@ -470,22 +458,6 @@ static void test_opts_parse(void)
     opts = qemu_opts_parse(&opts_list_03, "=val", false, &error_abort);
     g_assert_cmpuint(opts_count(opts), ==, 1);
     g_assert_cmpstr(qemu_opt_get(opts, ""), ==, "val");
-
-    /* Long key */
-    memset(long_key, 'a', 127);
-    long_key[127] = 'z';
-    long_key[128] = 0;
-    params = g_strdup_printf("%s=v", long_key);
-    opts = qemu_opts_parse(&opts_list_03, params + 1, NULL, &error_abort);
-    g_assert_cmpuint(opts_count(opts), ==, 1);
-    g_assert_cmpstr(qemu_opt_get(opts, long_key + 1), ==, "v");
-
-    /* Overlong key gets truncated */
-    opts = qemu_opts_parse(&opts_list_03, params, NULL, &error_abort);
-    g_assert(opts_count(opts) == 1);
-    long_key[127] = 0;
-    g_assert_cmpstr(qemu_opt_get(opts, long_key), ==, "v");
-    g_free(params);
 
     /* Multiple keys, last one wins */
     opts = qemu_opts_parse(&opts_list_03, "a=1,b=2,,x,a=3",
@@ -518,10 +490,10 @@ static void test_opts_parse(void)
     g_assert(!opts);
     /* TODO Cover .merge_lists = true */
 
-    /* Buggy ID recognition */
+    /* Buggy ID recognition (fixed) */
     opts = qemu_opts_parse(&opts_list_03, "x=,,id=bar", false, &error_abort);
     g_assert_cmpuint(opts_count(opts), ==, 1);
-    g_assert_cmpstr(qemu_opts_id(opts), ==, "bar"); /* BUG */
+    g_assert(!qemu_opts_id(opts));
     g_assert_cmpstr(qemu_opt_get(opts, "x"), ==, ",id=bar");
 
     /* Anti-social ID */
@@ -722,13 +694,12 @@ static void test_opts_parse_size(void)
     g_assert_cmpuint(opts_count(opts), ==, 3);
     g_assert_cmphex(qemu_opt_get_size(opts, "size1", 0), ==, 8);
     g_assert_cmphex(qemu_opt_get_size(opts, "size2", 0), ==, 1536);
-    g_assert_cmphex(qemu_opt_get_size(opts, "size3", 0), ==, 2 * M_BYTE);
+    g_assert_cmphex(qemu_opt_get_size(opts, "size3", 0), ==, 2 * MiB);
     opts = qemu_opts_parse(&opts_list_02, "size1=0.1G,size2=16777215T",
                            false, &error_abort);
     g_assert_cmpuint(opts_count(opts), ==, 2);
-    g_assert_cmphex(qemu_opt_get_size(opts, "size1", 0), ==, G_BYTE / 10);
-    g_assert_cmphex(qemu_opt_get_size(opts, "size2", 0),
-                     ==, 16777215 * T_BYTE);
+    g_assert_cmphex(qemu_opt_get_size(opts, "size1", 0), ==, GiB / 10);
+    g_assert_cmphex(qemu_opt_get_size(opts, "size2", 0), ==, 16777215ULL * TiB);
 
     /* Beyond limit with suffix */
     opts = qemu_opts_parse(&opts_list_02, "size1=16777216T",
@@ -745,6 +716,47 @@ static void test_opts_parse_size(void)
     g_assert(!opts);
 
     qemu_opts_reset(&opts_list_02);
+}
+
+static void test_has_help_option(void)
+{
+    static const struct {
+        const char *params;
+        /* expected value of qemu_opt_has_help_opt() with implied=false */
+        bool expect;
+        /* expected value of qemu_opt_has_help_opt() with implied=true */
+        bool expect_implied;
+    } test[] = {
+        { "help", true, false },
+        { "?", true, false },
+        { "helpme", false, false },
+        { "?me", false, false },
+        { "a,help", true, true },
+        { "a,?", true, true },
+        { "a=0,help,b", true, true },
+        { "a=0,?,b", true, true },
+        { "help,b=1", true, false },
+        { "?,b=1", true, false },
+        { "a,b,,help", true, true },
+        { "a,b,,?", true, true },
+    };
+    int i;
+    QemuOpts *opts;
+
+    for (i = 0; i < ARRAY_SIZE(test); i++) {
+        g_assert_cmpint(has_help_option(test[i].params),
+                        ==, test[i].expect);
+        opts = qemu_opts_parse(&opts_list_03, test[i].params, false,
+                               &error_abort);
+        g_assert_cmpint(qemu_opt_has_help_opt(opts),
+                        ==, test[i].expect);
+        qemu_opts_del(opts);
+        opts = qemu_opts_parse(&opts_list_03, test[i].params, true,
+                               &error_abort);
+        g_assert_cmpint(qemu_opt_has_help_opt(opts),
+                        ==, test[i].expect_implied);
+        qemu_opts_del(opts);
+    }
 }
 
 static void append_verify_list_01(QemuOptDesc *desc, bool with_overlapping)
@@ -887,7 +899,7 @@ static void test_opts_to_qdict_basic(void)
     g_assert_cmpstr(qdict_get_str(dict, "number1"), ==, "42");
     g_assert_false(qdict_haskey(dict, "number2"));
 
-    QDECREF(dict);
+    qobject_unref(dict);
     qemu_opts_del(opts);
 }
 
@@ -914,7 +926,7 @@ static void test_opts_to_qdict_filtered(void)
     g_assert_cmpstr(qdict_get_str(dict, "number1"), ==, "42");
     g_assert_false(qdict_haskey(dict, "number2"));
     g_assert_false(qdict_haskey(dict, "bool1"));
-    QDECREF(dict);
+    qobject_unref(dict);
 
     dict = qemu_opts_to_qdict_filtered(opts, NULL, &opts_list_02, false);
     g_assert(dict != NULL);
@@ -924,7 +936,7 @@ static void test_opts_to_qdict_filtered(void)
     g_assert_false(qdict_haskey(dict, "str3"));
     g_assert_false(qdict_haskey(dict, "number1"));
     g_assert_false(qdict_haskey(dict, "number2"));
-    QDECREF(dict);
+    qobject_unref(dict);
 
     /* Now delete converted options from opts */
     dict = qemu_opts_to_qdict_filtered(opts, NULL, &opts_list_01, true);
@@ -935,7 +947,7 @@ static void test_opts_to_qdict_filtered(void)
     g_assert_cmpstr(qdict_get_str(dict, "number1"), ==, "42");
     g_assert_false(qdict_haskey(dict, "number2"));
     g_assert_false(qdict_haskey(dict, "bool1"));
-    QDECREF(dict);
+    qobject_unref(dict);
 
     dict = qemu_opts_to_qdict_filtered(opts, NULL, &opts_list_02, true);
     g_assert(dict != NULL);
@@ -945,7 +957,7 @@ static void test_opts_to_qdict_filtered(void)
     g_assert_false(qdict_haskey(dict, "str3"));
     g_assert_false(qdict_haskey(dict, "number1"));
     g_assert_false(qdict_haskey(dict, "number2"));
-    QDECREF(dict);
+    qobject_unref(dict);
 
     g_assert_true(QTAILQ_EMPTY(&opts->head));
 
@@ -978,13 +990,13 @@ static void test_opts_to_qdict_duplicates(void)
     dict = qemu_opts_to_qdict(opts, NULL);
     g_assert(dict != NULL);
     g_assert_cmpstr(qdict_get_str(dict, "foo"), ==, "b");
-    QDECREF(dict);
+    qobject_unref(dict);
 
     /* The last one still wins if entries are deleted, and both are deleted */
     dict = qemu_opts_to_qdict_filtered(opts, NULL, NULL, true);
     g_assert(dict != NULL);
     g_assert_cmpstr(qdict_get_str(dict, "foo"), ==, "b");
-    QDECREF(dict);
+    qobject_unref(dict);
 
     g_assert_true(QTAILQ_EMPTY(&opts->head));
 
@@ -1009,6 +1021,7 @@ int main(int argc, char *argv[])
     g_test_add_func("/qemu-opts/opts_parse/bool", test_opts_parse_bool);
     g_test_add_func("/qemu-opts/opts_parse/number", test_opts_parse_number);
     g_test_add_func("/qemu-opts/opts_parse/size", test_opts_parse_size);
+    g_test_add_func("/qemu-opts/has_help_option", test_has_help_option);
     g_test_add_func("/qemu-opts/append_to_null", test_opts_append_to_null);
     g_test_add_func("/qemu-opts/append", test_opts_append);
     g_test_add_func("/qemu-opts/to_qdict/basic", test_opts_to_qdict_basic);
