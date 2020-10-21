@@ -19,6 +19,7 @@
 #endif
 #include "qemu/queue.h"
 #include "qemu/module.h"
+#include "qemu/cutils.h"
 #ifdef CONFIG_MODULE_UPGRADES
 #include "qemu-version.h"
 #endif
@@ -109,7 +110,7 @@ void module_call_init(module_init_type type)
 }
 
 #ifdef CONFIG_MODULES
-static int module_load_file(const char *fname)
+static int module_load_file(const char *fname, bool mayfail)
 {
     GModule *g_module;
     void (*sym)(void);
@@ -133,8 +134,10 @@ static int module_load_file(const char *fname)
 
     g_module = g_module_open(fname, G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
     if (!g_module) {
-        fprintf(stderr, "Failed to open module: %s\n",
-                g_module_error());
+        if (!mayfail) {
+            fprintf(stderr, "Failed to open module: %s\n",
+                    g_module_error());
+        }
         ret = -EINVAL;
         goto out;
     }
@@ -166,13 +169,12 @@ out:
 }
 #endif
 
-bool module_load_one(const char *prefix, const char *lib_name)
+bool module_load_one(const char *prefix, const char *lib_name, bool mayfail)
 {
     bool success = false;
 
 #ifdef CONFIG_MODULES
     char *fname = NULL;
-    char *exec_dir;
 #ifdef CONFIG_MODULE_UPGRADES
     char *version_dir;
 #endif
@@ -199,13 +201,12 @@ bool module_load_one(const char *prefix, const char *lib_name)
         return true;
     }
 
-    exec_dir = qemu_get_exec_dir();
     search_dir = getenv("QEMU_MODULE_DIR");
     if (search_dir != NULL) {
         dirs[n_dirs++] = g_strdup_printf("%s", search_dir);
     }
-    dirs[n_dirs++] = g_strdup_printf("%s", CONFIG_QEMU_MODDIR);
-    dirs[n_dirs++] = g_strdup_printf("%s", exec_dir ? : "");
+    dirs[n_dirs++] = get_relocated_path(CONFIG_QEMU_MODDIR);
+    dirs[n_dirs++] = g_strdup(qemu_get_exec_dir());
 
 #ifdef CONFIG_MODULE_UPGRADES
     version_dir = g_strcanon(g_strdup(QEMU_PKGVERSION),
@@ -216,13 +217,10 @@ bool module_load_one(const char *prefix, const char *lib_name)
 
     assert(n_dirs <= ARRAY_SIZE(dirs));
 
-    g_free(exec_dir);
-    exec_dir = NULL;
-
     for (i = 0; i < n_dirs; i++) {
         fname = g_strdup_printf("%s/%s%s",
                 dirs[i], module_name, CONFIG_HOST_DSOSUF);
-        ret = module_load_file(fname);
+        ret = module_load_file(fname, mayfail);
         g_free(fname);
         fname = NULL;
         /* Try loading until loaded a module file */
@@ -252,8 +250,10 @@ bool module_load_one(const char *prefix, const char *lib_name)
  * only a very few devices & objects.
  *
  * So with the expectation that this will be rather the exception than
- * to rule and the list will not gain that many entries go with a
+ * the rule and the list will not gain that many entries, go with a
  * simple manually maintained list for now.
+ *
+ * The list must be sorted by module (module_load_qom_all() needs this).
  */
 static struct {
     const char *type;
@@ -265,7 +265,11 @@ static struct {
     { "usb-redir",             "hw-", "usb-redirect"          },
     { "qxl-vga",               "hw-", "display-qxl"           },
     { "qxl",                   "hw-", "display-qxl"           },
+    { "virtio-gpu-device",     "hw-", "display-virtio-gpu"    },
+    { "vhost-user-gpu",        "hw-", "display-virtio-gpu"    },
     { "chardev-braille",       "chardev-", "baum"             },
+    { "chardev-spicevmc",      "chardev-", "spice"            },
+    { "chardev-spiceport",     "chardev-", "spice"            },
 };
 
 static bool module_loaded_qom_all;
@@ -277,13 +281,11 @@ void module_load_qom_one(const char *type)
     if (!type) {
         return;
     }
-    if (module_loaded_qom_all) {
-        return;
-    }
     for (i = 0; i < ARRAY_SIZE(qom_modules); i++) {
         if (strcmp(qom_modules[i].type, type) == 0) {
             module_load_one(qom_modules[i].prefix,
-                            qom_modules[i].module);
+                            qom_modules[i].module,
+                            false);
             return;
         }
     }
@@ -304,7 +306,7 @@ void module_load_qom_all(void)
             /* one module implementing multiple types -> load only once */
             continue;
         }
-        module_load_one(qom_modules[i].prefix, qom_modules[i].module);
+        module_load_one(qom_modules[i].prefix, qom_modules[i].module, true);
     }
     module_loaded_qom_all = true;
 }

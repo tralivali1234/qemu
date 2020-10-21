@@ -51,6 +51,7 @@
 #include <math.h>
 
 #include "trace.h"
+#include "qemu/cutils.h"
 #include "ui/input.h"
 #include "sysemu/runstate.h"
 #include "sysemu/sysemu.h"
@@ -171,14 +172,16 @@ struct GtkDisplayState {
     DisplayOptions *opts;
 };
 
-typedef struct VCChardev {
+struct VCChardev {
     Chardev parent;
     VirtualConsole *console;
     bool echo;
-} VCChardev;
+};
+typedef struct VCChardev VCChardev;
 
 #define TYPE_CHARDEV_VC "chardev-vc"
-#define VC_CHARDEV(obj) OBJECT_CHECK(VCChardev, (obj), TYPE_CHARDEV_VC)
+DECLARE_INSTANCE_CHECKER(VCChardev, VC_CHARDEV,
+                         TYPE_CHARDEV_VC)
 
 bool gtk_use_gl_area;
 
@@ -2200,6 +2203,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     GtkDisplayState *s = g_malloc0(sizeof(*s));
     GdkDisplay *window_display;
     GtkIconTheme *theme;
+    char *dir;
 
     if (!gtkinit) {
         fprintf(stderr, "gtk initialization failed\n");
@@ -2209,7 +2213,9 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     s->opts = opts;
 
     theme = gtk_icon_theme_get_default();
-    gtk_icon_theme_prepend_search_path(theme, CONFIG_QEMU_ICONDIR);
+    dir = get_relocated_path(CONFIG_QEMU_ICONDIR);
+    gtk_icon_theme_prepend_search_path(theme, dir);
+    g_free(dir);
     g_set_prgname("qemu");
 
     s->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -2225,7 +2231,9 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
      * sure that we don't accidentally break implicit assumptions.  */
     setlocale(LC_MESSAGES, "");
     setlocale(LC_CTYPE, "C.UTF-8");
-    bindtextdomain("qemu", CONFIG_QEMU_LOCALEDIR);
+    dir = get_relocated_path(CONFIG_QEMU_LOCALEDIR);
+    bindtextdomain("qemu", dir);
+    g_free(dir);
     bind_textdomain_codeset("qemu", "UTF-8");
     textdomain("qemu");
 

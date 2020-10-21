@@ -76,7 +76,7 @@ Options
     I/O timeout in seconds.  The default depends on cache= option.
 
   * writeback|no_writeback -
-    Enable/disable writeback cache. The cache alows the FUSE client to buffer
+    Enable/disable writeback cache. The cache allows the FUSE client to buffer
     and merge write requests.  The default is ``no_writeback``.
 
   * xattr|no_xattr -
@@ -86,6 +86,10 @@ Options
 .. option:: --socket-path=PATH
 
   Listen on vhost-user UNIX domain socket at PATH.
+
+.. option:: --socket-group=GROUP
+
+  Set the vhost-user UNIX domain socket gid to GROUP.
 
 .. option:: --fd=FDNUM
 
@@ -103,6 +107,7 @@ Options
   forbids the FUSE client from caching to achieve best coherency at the cost of
   performance.  ``auto`` acts similar to NFS with a 1 second metadata cache
   timeout.  ``always`` sets a long cache lifetime at the expense of coherency.
+  The default is ``auto``.
 
 Examples
 --------

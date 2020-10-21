@@ -37,6 +37,16 @@ struct AioHandler {
 
 static void aio_remove_fd_handler(AioContext *ctx, AioHandler *node)
 {
+    /*
+     * If the GSource is in the process of being destroyed then
+     * g_source_remove_poll() causes an assertion failure.  Skip
+     * removal in that case, because glib cleans up its state during
+     * destruction anyway.
+     */
+    if (!g_source_is_destroyed(&ctx->source)) {
+        g_source_remove_poll(&ctx->source, &node->pfd);
+    }
+
     /* If aio_poll is in progress, just mark the node as deleted */
     if (qemu_lockcnt_count(&ctx->list_lock)) {
         node->deleted = 1;
@@ -139,8 +149,6 @@ void aio_set_event_notifier(AioContext *ctx,
     /* Are we deleting the fd handler? */
     if (!io_notify) {
         if (node) {
-            g_source_remove_poll(&ctx->source, &node->pfd);
-
             aio_remove_fd_handler(ctx, node);
         }
     } else {
@@ -337,7 +345,7 @@ bool aio_poll(AioContext *ctx, bool blocking)
      * so disable the optimization now.
      */
     if (blocking) {
-        atomic_set(&ctx->notify_me, atomic_read(&ctx->notify_me) + 2);
+        qatomic_set(&ctx->notify_me, qatomic_read(&ctx->notify_me) + 2);
         /*
          * Write ctx->notify_me before computing the timeout
          * (reading bottom half flags, etc.).  Pairs with
@@ -376,7 +384,8 @@ bool aio_poll(AioContext *ctx, bool blocking)
         ret = WaitForMultipleObjects(count, events, FALSE, timeout);
         if (blocking) {
             assert(first);
-            atomic_store_release(&ctx->notify_me, atomic_read(&ctx->notify_me) - 2);
+            qatomic_store_release(&ctx->notify_me,
+                                  qatomic_read(&ctx->notify_me) - 2);
             aio_notify_accept(ctx);
         }
 

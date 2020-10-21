@@ -18,7 +18,7 @@
 #include "qemu/queue.h"
 
 #define TYPE_CLOCK "clock"
-#define CLOCK(obj) OBJECT_CHECK(Clock, (obj), TYPE_CLOCK)
+OBJECT_DECLARE_SIMPLE_TYPE(Clock, CLOCK)
 
 typedef void ClockCallback(void *opaque);
 
@@ -54,7 +54,6 @@ typedef void ClockCallback(void *opaque);
  * @sibling: structure used to form a clock list
  */
 
-typedef struct Clock Clock;
 
 struct Clock {
     /*< private >*/
@@ -90,6 +89,19 @@ extern const VMStateDescription vmstate_clock;
  * compute the canonical path of the clock (used by log messages)
  */
 void clock_setup_canonical_path(Clock *clk);
+
+/**
+ * clock_new:
+ * @parent: the clock parent
+ * @name: the clock object name
+ *
+ * Helper function to create a new clock and parent it to @parent. There is no
+ * need to call clock_setup_canonical_path on the returned clock as it is done
+ * by this function.
+ *
+ * @return the newly created clock
+ */
+Clock *clock_new(Object *parent, const char *name);
 
 /**
  * clock_set_callback:

@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qapi/error.h"
 #include "cpu.h"
 #include "exec/memory.h"
@@ -24,7 +25,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/qemu-print.h"
 #include "qom/object.h"
-#include "trace/trace-root.h"
+#include "trace.h"
 
 #include "exec/memory-internal.h"
 #include "exec/ram_addr.h"
@@ -294,12 +295,12 @@ static void flatview_destroy(FlatView *view)
 
 static bool flatview_ref(FlatView *view)
 {
-    return atomic_fetch_inc_nonzero(&view->ref) > 0;
+    return qatomic_fetch_inc_nonzero(&view->ref) > 0;
 }
 
 void flatview_unref(FlatView *view)
 {
-    if (atomic_fetch_dec(&view->ref) == 1) {
+    if (qatomic_fetch_dec(&view->ref) == 1) {
         trace_flatview_destroy_rcu(view, view->root);
         assert(view->root);
         call_rcu(view, flatview_destroy, rcu);
@@ -1027,7 +1028,7 @@ static void address_space_set_flatview(AddressSpace *as)
     }
 
     /* Writes are protected by the BQL.  */
-    atomic_rcu_set(&as->current_map, new_view);
+    qatomic_rcu_set(&as->current_map, new_view);
     if (old_view) {
         flatview_unref(old_view);
     }
@@ -1221,7 +1222,6 @@ static void memory_region_initfn(Object *obj)
     mr->ops = &unassigned_mem_ops;
     mr->enabled = true;
     mr->romd_mode = true;
-    mr->global_locking = true;
     mr->destructor = memory_region_destructor_none;
     QTAILQ_INIT(&mr->subregions);
     QTAILQ_INIT(&mr->coalesced);
@@ -1354,10 +1354,18 @@ bool memory_region_access_valid(MemoryRegion *mr,
 {
     if (mr->ops->valid.accepts
         && !mr->ops->valid.accepts(mr->opaque, addr, size, is_write, attrs)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Invalid access at addr "
+                                       "0x%" HWADDR_PRIX ", size %u, "
+                                       "region '%s', reason: rejected\n",
+                      addr, size, memory_region_name(mr));
         return false;
     }
 
     if (!mr->ops->valid.unaligned && (addr & (size - 1))) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Invalid access at addr "
+                                       "0x%" HWADDR_PRIX ", size %u, "
+                                       "region '%s', reason: unaligned\n",
+                      addr, size, memory_region_name(mr));
         return false;
     }
 
@@ -1368,6 +1376,13 @@ bool memory_region_access_valid(MemoryRegion *mr,
 
     if (size > mr->ops->valid.max_access_size
         || size < mr->ops->valid.min_access_size) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Invalid access at addr "
+                                       "0x%" HWADDR_PRIX ", size %u, "
+                                       "region '%s', reason: invalid size "
+                                       "(min:%u max:%u)\n",
+                      addr, size, memory_region_name(mr),
+                      mr->ops->valid.min_access_size,
+                      mr->ops->valid.max_access_size);
         return false;
     }
     return true;
@@ -2275,11 +2290,6 @@ void memory_region_clear_flush_coalesced(MemoryRegion *mr)
     if (QTAILQ_EMPTY(&mr->coalesced)) {
         mr->flush_coalesced_mmio = false;
     }
-}
-
-void memory_region_clear_global_locking(MemoryRegion *mr)
-{
-    mr->global_locking = false;
 }
 
 static bool userspace_eventfd_warning;

@@ -1,5 +1,5 @@
 softmmu_ss.add(pixman)
-specific_ss.add(pixman)   # for the include path
+specific_ss.add(when: ['CONFIG_SOFTMMU'], if_true: pixman)   # for the include path
 
 softmmu_ss.add(files(
   'console.c',
@@ -14,8 +14,8 @@ softmmu_ss.add(files(
 ))
 
 softmmu_ss.add(when: 'CONFIG_LINUX', if_true: files('input-linux.c'))
-softmmu_ss.add(when: 'CONFIG_SPICE', if_true: files('spice-core.c', 'spice-input.c', 'spice-display.c'))
-softmmu_ss.add(when: [cocoa, 'CONFIG_COCOA'], if_true: files('cocoa.m'))
+softmmu_ss.add(when: [spice, 'CONFIG_SPICE'], if_true: files('spice-core.c', 'spice-input.c', 'spice-display.c'))
+softmmu_ss.add(when: cocoa, if_true: files('cocoa.m'))
 
 vnc_ss = ss.source_set()
 vnc_ss.add(files(
@@ -35,10 +35,11 @@ softmmu_ss.add_all(when: vnc, if_true: vnc_ss)
 softmmu_ss.add(when: vnc, if_false: files('vnc-stubs.c'))
 softmmu_ss.add(when: [opengl, 'CONFIG_OPENGL'], if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
 softmmu_ss.add(when: [opengl, 'CONFIG_OPENGL_DMABUF'], if_true: files('egl-headless.c'))
+specific_ss.add(when: ['CONFIG_SOFTMMU'], if_true: opengl)
 
 ui_modules = {}
 
-if config_host.has_key('CONFIG_CURSES')
+if curses.found()
   curses_ss = ss.source_set()
   curses_ss.add(when: [curses, iconv], if_true: [files('curses.c'), pixman])
   ui_modules += {'curses' : curses_ss}
@@ -112,8 +113,11 @@ if have_system or xkbcommon.found()
 endif
 
 subdir('shader')
-subdir('icons')
 
-install_data('qemu.desktop', install_dir: config_host['qemu_desktopdir'])
+if have_system
+  subdir('icons')
+
+  install_data('qemu.desktop', install_dir: config_host['qemu_desktopdir'])
+endif
 
 modules += {'ui': ui_modules}

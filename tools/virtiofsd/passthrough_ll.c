@@ -151,6 +151,7 @@ struct lo_data {
     int timeout_set;
     int readdirplus_set;
     int readdirplus_clear;
+    int allow_direct_io;
     struct lo_inode root;
     GHashTable *inodes; /* protected by lo->mutex */
     struct lo_map ino_map; /* protected by lo->mutex */
@@ -179,6 +180,8 @@ static const struct fuse_opt lo_opts[] = {
     { "cache=always", offsetof(struct lo_data, cache), CACHE_ALWAYS },
     { "readdirplus", offsetof(struct lo_data, readdirplus_set), 1 },
     { "no_readdirplus", offsetof(struct lo_data, readdirplus_clear), 1 },
+    { "allow_direct_io", offsetof(struct lo_data, allow_direct_io), 1 },
+    { "no_allow_direct_io", offsetof(struct lo_data, allow_direct_io), 0 },
     FUSE_OPT_END
 };
 static bool use_syslog = false;
@@ -617,7 +620,7 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     struct lo_inode *inode;
     int ifd;
     int res;
-    int fd;
+    int fd = -1;
 
     inode = lo_inode(req, ino);
     if (!inode) {
@@ -1516,7 +1519,8 @@ static void lo_releasedir(fuse_req_t req, fuse_ino_t ino,
     fuse_reply_err(req, 0);
 }
 
-static void update_open_flags(int writeback, struct fuse_file_info *fi)
+static void update_open_flags(int writeback, int allow_direct_io,
+                              struct fuse_file_info *fi)
 {
     /*
      * With writeback cache, kernel may send read requests even
@@ -1541,10 +1545,13 @@ static void update_open_flags(int writeback, struct fuse_file_info *fi)
 
     /*
      * O_DIRECT in guest should not necessarily mean bypassing page
-     * cache on host as well. If somebody needs that behavior, it
-     * probably should be a configuration knob in daemon.
+     * cache on host as well. Therefore, we discard it by default
+     * ('-o no_allow_direct_io'). If somebody needs that behavior,
+     * the '-o allow_direct_io' option should be set.
      */
-    fi->flags &= ~O_DIRECT;
+    if (!allow_direct_io) {
+        fi->flags &= ~O_DIRECT;
+    }
 }
 
 static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
@@ -1576,7 +1583,7 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
         goto out;
     }
 
-    update_open_flags(lo->writeback, fi);
+    update_open_flags(lo->writeback, lo->allow_direct_io, fi);
 
     fd = openat(parent_inode->fd, name, (fi->flags | O_CREAT) & ~O_NOFOLLOW,
                 mode);
@@ -1786,7 +1793,7 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
     fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n", ino,
              fi->flags);
 
-    update_open_flags(lo->writeback, fi);
+    update_open_flags(lo->writeback, lo->allow_direct_io, fi);
 
     sprintf(buf, "%i", lo_fd(req, ino));
     fd = openat(lo->proc_self_fd, buf, fi->flags & ~O_NOFOLLOW);
@@ -2386,8 +2393,6 @@ static void setup_wait_parent_capabilities(void)
 static void setup_namespaces(struct lo_data *lo, struct fuse_session *se)
 {
     pid_t child;
-    char template[] = "virtiofsd-XXXXXX";
-    char *tmpdir;
 
     /*
      * Create a new pid namespace for *child* processes.  We'll have to
@@ -2451,32 +2456,22 @@ static void setup_namespaces(struct lo_data *lo, struct fuse_session *se)
         exit(1);
     }
 
-    tmpdir = mkdtemp(template);
-    if (!tmpdir) {
-        fuse_log(FUSE_LOG_ERR, "tmpdir(%s): %m\n", template);
+    /*
+     * We only need /proc/self/fd. Prevent ".." from accessing parent
+     * directories of /proc/self/fd by bind-mounting it over /proc. Since / was
+     * previously remounted with MS_REC | MS_SLAVE this mount change only
+     * affects our process.
+     */
+    if (mount("/proc/self/fd", "/proc", NULL, MS_BIND, NULL) < 0) {
+        fuse_log(FUSE_LOG_ERR, "mount(/proc/self/fd, MS_BIND): %m\n");
         exit(1);
     }
 
-    if (mount("/proc/self/fd", tmpdir, NULL, MS_BIND, NULL) < 0) {
-        fuse_log(FUSE_LOG_ERR, "mount(/proc/self/fd, %s, MS_BIND): %m\n",
-                 tmpdir);
-        exit(1);
-    }
-
-    /* Now we can get our /proc/self/fd directory file descriptor */
-    lo->proc_self_fd = open(tmpdir, O_PATH);
+    /* Get the /proc (actually /proc/self/fd, see above) file descriptor */
+    lo->proc_self_fd = open("/proc", O_PATH);
     if (lo->proc_self_fd == -1) {
-        fuse_log(FUSE_LOG_ERR, "open(%s, O_PATH): %m\n", tmpdir);
+        fuse_log(FUSE_LOG_ERR, "open(/proc, O_PATH): %m\n");
         exit(1);
-    }
-
-    if (umount2(tmpdir, MNT_DETACH) < 0) {
-        fuse_log(FUSE_LOG_ERR, "umount2(%s, MNT_DETACH): %m\n", tmpdir);
-        exit(1);
-    }
-
-    if (rmdir(tmpdir) < 0) {
-        fuse_log(FUSE_LOG_ERR, "rmdir(%s): %m\n", tmpdir);
     }
 }
 
@@ -2823,6 +2818,7 @@ int main(int argc, char *argv[])
         .debug = 0,
         .writeback = 0,
         .posix_lock = 0,
+        .allow_direct_io = 0,
         .proc_self_fd = -1,
     };
     struct lo_map_elem *root_elem;
@@ -2830,6 +2826,8 @@ int main(int argc, char *argv[])
 
     /* Don't mask creation mode, kernel already did that */
     umask(0);
+
+    qemu_init_exec_dir(argv[0]);
 
     pthread_mutex_init(&lo.mutex, NULL);
     lo.inodes = g_hash_table_new(lo_key_hash, lo_key_equal);

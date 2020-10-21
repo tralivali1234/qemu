@@ -299,8 +299,8 @@ static int write_vstart(CPURISCVState *env, int csrno, target_ulong val)
 static int read_instret(CPURISCVState *env, int csrno, target_ulong *val)
 {
 #if !defined(CONFIG_USER_ONLY)
-    if (use_icount) {
-        *val = cpu_get_icount();
+    if (icount_enabled()) {
+        *val = icount_get();
     } else {
         *val = cpu_get_host_ticks();
     }
@@ -314,8 +314,8 @@ static int read_instret(CPURISCVState *env, int csrno, target_ulong *val)
 static int read_instreth(CPURISCVState *env, int csrno, target_ulong *val)
 {
 #if !defined(CONFIG_USER_ONLY)
-    if (use_icount) {
-        *val = cpu_get_icount() >> 32;
+    if (icount_enabled()) {
+        *val = icount_get() >> 32;
     } else {
         *val = cpu_get_host_ticks() >> 32;
     }
@@ -351,7 +351,7 @@ static int read_time(CPURISCVState *env, int csrno, target_ulong *val)
         return -RISCV_EXCP_ILLEGAL_INST;
     }
 
-    *val = env->rdtime_fn() + delta;
+    *val = env->rdtime_fn(env->rdtime_fn_arg) + delta;
     return 0;
 }
 
@@ -364,7 +364,7 @@ static int read_timeh(CPURISCVState *env, int csrno, target_ulong *val)
         return -RISCV_EXCP_ILLEGAL_INST;
     }
 
-    *val = (env->rdtime_fn() + delta) >> 32;
+    *val = (env->rdtime_fn(env->rdtime_fn_arg) + delta) >> 32;
     return 0;
 }
 #endif

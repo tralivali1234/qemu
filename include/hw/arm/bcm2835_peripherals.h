@@ -29,12 +29,12 @@
 #include "hw/timer/bcm2835_systmr.h"
 #include "hw/usb/hcd-dwc2.h"
 #include "hw/misc/unimp.h"
+#include "qom/object.h"
 
 #define TYPE_BCM2835_PERIPHERALS "bcm2835-peripherals"
-#define BCM2835_PERIPHERALS(obj) \
-    OBJECT_CHECK(BCM2835PeripheralState, (obj), TYPE_BCM2835_PERIPHERALS)
+OBJECT_DECLARE_SIMPLE_TYPE(BCM2835PeripheralState, BCM2835_PERIPHERALS)
 
-typedef struct BCM2835PeripheralState {
+struct BCM2835PeripheralState {
     /*< private >*/
     SysBusDevice parent_obj;
     /*< public >*/
@@ -45,6 +45,7 @@ typedef struct BCM2835PeripheralState {
 
     BCM2835SystemTimerState systmr;
     BCM2835MphiState mphi;
+    UnimplementedDeviceState txp;
     UnimplementedDeviceState armtmr;
     UnimplementedDeviceState cprman;
     UnimplementedDeviceState a2w;
@@ -66,10 +67,11 @@ typedef struct BCM2835PeripheralState {
     UnimplementedDeviceState otp;
     UnimplementedDeviceState dbus;
     UnimplementedDeviceState ave0;
+    UnimplementedDeviceState v3d;
     UnimplementedDeviceState bscsl;
     UnimplementedDeviceState smi;
     DWC2State dwc2;
     UnimplementedDeviceState sdramc;
-} BCM2835PeripheralState;
+};
 
 #endif /* BCM2835_PERIPHERALS_H */

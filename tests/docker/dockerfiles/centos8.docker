@@ -8,6 +8,7 @@ ENV PACKAGES \
     dbus-daemon \
     gcc \
     gcc-c++ \
+    genisoimage \
     gettext \
     git \
     glib2-devel \
@@ -18,6 +19,7 @@ ENV PACKAGES \
     make \
     mesa-libEGL-devel \
     nettle-devel \
+    ninja-build \
     perl-Test-Harness \
     pixman-devel \
     python36 \
@@ -27,5 +29,7 @@ ENV PACKAGES \
     tar \
     zlib-devel
 
-RUN dnf install -y $PACKAGES
+RUN dnf install -y dnf-plugins-core && \
+  dnf config-manager --set-enabled PowerTools && \
+  dnf install -y $PACKAGES
 RUN rpm -q $PACKAGES | sort > /packages.txt
